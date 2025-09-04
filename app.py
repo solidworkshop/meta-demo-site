@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-# Flask app with: Pixel demo page, /ingest (CAPI forwarder), and auto Start/Stop streamer
+# Flask app: Demo page (Meta Pixel + buttons), /ingest (CAPI forwarder),
+# and a Start/Stop auto streamer that sends server-side CAPI events.
 import os, json, hashlib, time, random, uuid, threading
 from datetime import datetime, timezone
 from flask import Flask, request, Response, jsonify, has_request_context
@@ -18,14 +19,14 @@ CAPI_URL        = f"https://graph.facebook.com/{GRAPH_VER}/{PIXEL_ID}/events"
 app = Flask(__name__)
 
 # ---------- helpers ----------
-def sha256_norm(s: str) -> str:
+def sha256_norm(s):
     norm = (s or "").strip().lower()
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()
 
-def now_unix() -> int:
+def now_unix():
     return int(datetime.now(tz=timezone.utc).timestamp())
 
-def iso_to_unix(ts_iso: str) -> int:
+def iso_to_unix(ts_iso):
     dt = datetime.fromisoformat(ts_iso.replace("Z","+00:00"))
     return int(dt.replace(tzinfo=timezone.utc).timestamp())
 
@@ -134,21 +135,37 @@ def map_sim_event_to_capi(e):
 
     return []
 
-# ---------- HTML page ----------
+# ---------- HTML (with checkmark-in-button feedback) ----------
 PAGE_HTML = f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Demo Store</title>
 <style>
-  body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 2rem; }}
+  :root {{ --bd:#ddd; --fg:#222; --muted:#555; --ok:#0a8a30; }}
+  body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 2rem; color: var(--fg); }}
   .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }}
-  .card {{ border:1px solid #ddd; border-radius:12px; padding:16px; }}
-  button {{ padding:8px 12px; border-radius:8px; border:1px solid #ccc; cursor:pointer; }}
+  .card {{ border:1px solid var(--bd); border-radius:12px; padding:16px; }}
   .row {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }}
   input[type=number] {{ width: 120px; padding:6px 8px; }}
-  .small {{ font-size: 12px; color:#555; }}
+  .small {{ font-size: 12px; color: var(--muted); }}
+  .btn {{
+    position: relative; padding: 8px 36px 8px 12px;
+    border-radius: 10px; border:1px solid var(--bd);
+    background:#fff; cursor:pointer; line-height:1.1;
+  }}
+  .btn:disabled {{ opacity: .6; cursor: not-allowed; }}
+  .btn .tick {{
+    position:absolute; right:10px; top:50%;
+    transform: translateY(-50%) scale(0.8);
+    opacity:0; transition: opacity .18s ease, transform .18s ease;
+    pointer-events:none; color: var(--ok);
+    display:inline-flex; align-items:center; justify-content:center;
+  }}
+  .btn.show-tick .tick {{ opacity:1; transform: translateY(-50%) scale(1); }}
+  .btn .tick svg {{ width:18px; height:18px; }}
 </style>
 <script>
+/* Meta Pixel */
 !function(f,b,e,v,n,t,s){{if(f.fbq)return;n=f.fbq=function(){{n.callMethod?
 n.callMethod.apply(n,arguments):n.queue.push(arguments)}};if(!f._fbq)f._fbq=n;
 n.push=n; n.loaded=!0; n.version='2.0'; n.queue=[]; t=b.createElement(e);
@@ -157,61 +174,72 @@ t.async=!0; t.src=v; s=b.getElementsByTagName(e)[0]; s.parentNode.insertBefore(t
 fbq('init', '{PIXEL_ID}');
 fbq('track', 'PageView');
 
+/* Helpers */
 function rid(){{ return 'evt_' + Math.random().toString(36).slice(2) + Date.now().toString(36); }}
+function flashCheck(btn) {{
+  if (!btn) return;
+  btn.classList.add('show-tick');
+  setTimeout(()=> btn.classList.remove('show-tick'), 900);
+}}
+async function safeFetch(url, opts) {{
+  try {{ const r = await fetch(url, opts); return r.ok; }} catch (_) {{ return false; }}
+}}
 
-function sendView(){{
+/* Pixel event buttons - pass the clicked button as 'this' */
+function sendView(btn){{
   fbq('track', 'ViewContent', {{
     content_type:'product', content_ids:['SKU-10057'], currency:'USD', value:68.99
   }}, {{eventID: rid()}});
-  alert('Pixel: ViewContent sent');
+  flashCheck(btn);
 }}
-function sendATC(){{
+function sendATC(btn){{
   fbq('track', 'AddToCart', {{
     content_type:'product', content_ids:['SKU-10057'],
     contents:[{{id:'SKU-10057', quantity:1, item_price:68.99}}],
     currency:'USD', value:68.99
   }}, {{eventID: rid()}});
-  alert('Pixel: AddToCart sent');
+  flashCheck(btn);
 }}
-function sendInitiate(){{
+function sendInitiate(btn){{
   fbq('track', 'InitiateCheckout', {{
     contents:[{{id:'SKU-10057', quantity:2, item_price:68.99}}],
     currency:'USD', value:149.02
   }}, {{eventID: rid()}});
-  alert('Pixel: InitiateCheckout sent');
+  flashCheck(btn);
 }}
-function sendPurchase(){{
+function sendPurchase(btn){{
   fbq('track', 'Purchase', {{
     contents:[{{id:'SKU-10057', quantity:2, item_price:68.99}}],
     currency:'USD', value:149.02
   }}, {{eventID: rid()}});
-  alert('Pixel: Purchase sent');
+  flashCheck(btn);
 }}
 
-// --- Auto streamer controls ---
+/* Auto streamer controls (server → CAPI) */
 async function refreshStatus(){{
   try {{
-    const r = await fetch('/auto/status');
-    const j = await r.json();
+    const r = await fetch('/auto/status'); const j = await r.json();
     document.getElementById('status').textContent = j.running ? 
       ('Running at ' + j.rps + ' sessions/sec') : 'Stopped';
     document.getElementById('startBtn').disabled = j.running;
     document.getElementById('stopBtn').disabled = !j.running;
-    if (j.running) {{
-      document.getElementById('rps').value = j.rps;
-    }}
+    if (j.running) {{ document.getElementById('rps').value = j.rps; }}
   }} catch (e) {{
     document.getElementById('status').textContent = 'Unknown (server error)';
   }}
 }}
-async function startAuto(){{
+async function startAuto(btn){{
   const rps = parseFloat(document.getElementById('rps').value || '0.5');
-  await fetch('/auto/start?rps=' + encodeURIComponent(rps));
-  setTimeout(refreshStatus, 300);
+  if (await safeFetch('/auto/start?rps=' + encodeURIComponent(rps))) {{
+    flashCheck(btn);
+    setTimeout(refreshStatus, 250);
+  }}
 }}
-async function stopAuto(){{
-  await fetch('/auto/stop');
-  setTimeout(refreshStatus, 300);
+async function stopAuto(btn){{
+  if (await safeFetch('/auto/stop')) {{
+    flashCheck(btn);
+    setTimeout(refreshStatus, 250);
+  }}
 }}
 window.addEventListener('load', refreshStatus);
 </script>
@@ -223,17 +251,65 @@ window.addEventListener('load', refreshStatus);
   <p class="small">Pixel is active. Buttons send browser events. The auto streamer sends server (CAPI) events from the server itself.</p>
 
   <div class="grid">
-    <div class="card"><h3>ViewContent</h3><button onclick="sendView()">Send ViewContent</button></div>
-    <div class="card"><h3>AddToCart</h3><button onclick="sendATC()">Send AddToCart</button></div>
-    <div class="card"><h3>InitiateCheckout</h3><button onclick="sendInitiate()">Send InitiateCheckout</button></div>
-    <div class="card"><h3>Purchase</h3><button onclick="sendPurchase()">Send Purchase</button></div>
+    <div class="card">
+      <h3>ViewContent</h3>
+      <button class="btn" onclick="sendView(this)">
+        Send ViewContent
+        <span class="tick" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg>
+        </span>
+      </button>
+    </div>
+
+    <div class="card">
+      <h3>AddToCart</h3>
+      <button class="btn" onclick="sendATC(this)">
+        Send AddToCart
+        <span class="tick" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg>
+        </span>
+      </button>
+    </div>
+
+    <div class="card">
+      <h3>InitiateCheckout</h3>
+      <button class="btn" onclick="sendInitiate(this)">
+        Send InitiateCheckout
+        <span class="tick" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg>
+        </span>
+      </button>
+    </div>
+
+    <div class="card">
+      <h3>Purchase</h3>
+      <button class="btn" onclick="sendPurchase(this)">
+        Send Purchase
+        <span class="tick" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg>
+        </span>
+      </button>
+    </div>
+
     <div class="card">
       <h3>Auto Stream (server → CAPI)</h3>
-      <div class="row">
+      <div class="row" style="margin-bottom:8px;">
         <label>Sessions/sec:</label>
         <input id="rps" type="number" step="0.1" min="0.1" value="0.5"/>
-        <button id="startBtn" onclick="startAuto()">Start Auto Stream</button>
-        <button id="stopBtn" onclick="stopAuto()">Stop</button>
+      </div>
+      <div class="row">
+        <button id="startBtn" class="btn" onclick="startAuto(this)">
+          Start Auto Stream
+          <span class="tick" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg>
+          </span>
+        </button>
+        <button id="stopBtn" class="btn" onclick="stopAuto(this)">
+          Stop
+          <span class="tick" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg>
+          </span>
+        </button>
       </div>
       <p id="status" class="small">…</p>
     </div>
@@ -315,11 +391,11 @@ def _event_base(session, **extra):
     }
 
 def _send_simulated_session_once():
-    """Generate a short funnel and push to CAPI (no HTTP back to /ingest)."""
+    """Generate a short funnel and push directly to CAPI (no HTTP back to /ingest)."""
     s = _make_session()
     product = _make_product()
 
-    # page_view
+    # page_view and product_view
     for evt in [
         _event_base(s, event_type="page_view", page=_pick(["/","/home","/sale"])),
         _event_base(s, event_type="product_view", product=product),
@@ -368,18 +444,15 @@ def _send_simulated_session_once():
 
 def _auto_loop():
     global _current_rps
-    # simple loop: every 1/rps seconds, generate one session funnel
     while not _stop_evt.is_set():
         start = time.time()
         try:
             _send_simulated_session_once()
         except Exception:
             pass
-        # sleep to honor target rps
-        delay = max(0.05, 1.0 / max(0.1, _current_rps))  # clamp values
+        delay = max(0.05, 1.0 / max(0.1, _current_rps))  # clamp rps to sane range
         elapsed = time.time() - start
-        time_to_sleep = max(0.0, delay - elapsed)
-        _stop_evt.wait(time_to_sleep)
+        _stop_evt.wait(max(0.0, delay - elapsed))
 
 @app.route("/auto/start")
 def auto_start():
@@ -415,6 +488,7 @@ def auto_status():
 
 # ---------- entrypoint ----------
 if __name__ == "__main__":
-    # local run
+    # local run (Render uses gunicorn with PORT env)
     port = int(os.getenv("PORT", "5000"))
-    app.run(host="127.0.0.1", port=port, debug=True)
+    app.run(host="0.0.0.0", port=port, debug=True)
+
