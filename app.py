@@ -33,7 +33,7 @@ except Exception:
 
 FILE_SINK_PATH  = os.getenv("FILE_SINK_PATH", "")  # e.g. "events.ndjson"
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 app = Flask(__name__)
 
@@ -121,21 +121,14 @@ reseed()
 
 # -------------------- Telemetry & storage --------------------
 EVENT_LOG_MAX = 800
-EVENT_LOG: deque = deque(maxlen=EVENT_LOG_MAX)  # list of dicts: {ts, channel, event_name, intended, sent, response, ok, event_id, diff, flags}
-COUNTS = defaultdict(int)  # rolling counters
-DEDUP = {
-    "pixel_ids": set(),
-    "capi_ids": set(),
-    "matched": 0,
-    "pixel_only": 0,
-    "capi_only": 0
-}
+EVENT_LOG: deque = deque(maxlen=EVENT_LOG_MAX)  # dicts: {ts, channel, event_name, intended, sent, response, ok, event_id, diff}
+COUNTS = defaultdict(int)
+DEDUP = {"pixel_ids": set(), "capi_ids": set(), "matched": 0, "pixel_only": 0, "capi_only": 0}
 METRICS_LOCK = threading.Lock()
 
 def _log_event(entry: Dict[str,Any]):
     with METRICS_LOCK:
         EVENT_LOG.appendleft(entry)
-        # counters
         ch = entry.get("channel","")
         name = entry.get("event_name","")
         ok = entry.get("ok", False)
@@ -143,8 +136,6 @@ def _log_event(entry: Dict[str,Any]):
         COUNTS[f"sent_{ch}_{name}"] += 1
         if not ok:
             COUNTS["errors"] += 1
-
-        # dedup tallies
         eid = (entry.get("event_id") or "")
         if eid:
             if ch == "pixel":
@@ -176,7 +167,7 @@ def iso_to_unix(ts_iso):
 
 def get_cfg_snapshot():
     with CONFIG_LOCK:
-        return json.loads(json.dumps(CONFIG))  # deep copy safe for nested
+        return json.loads(json.dumps(CONFIG))  # deep copy
 
 def clampf(v, lo, hi, default):
     try: x = float(v)
@@ -202,7 +193,7 @@ def rand_uniform(a,b):
     return _rng.random() * (hi - lo) + lo
 
 def rand_triangular(low, high, mode=None):
-    """Triangular distribution for prices (more realistic than uniform)."""
+    """Triangular distribution for prices."""
     if mode is None:
         mode = (low + high) / 2
     u = _rng.random()
@@ -242,7 +233,6 @@ def _margin_from_contents(contents, cfg):
 
 def append_margin_pltv(custom_data, cfg, single_price=None, contents=None):
     if custom_data is None: custom_data = {}
-    # margin
     if cfg.get("append_margin"):
         margin_val = None
         if contents:
@@ -256,7 +246,6 @@ def append_margin_pltv(custom_data, cfg, single_price=None, contents=None):
                 pass
         if margin_val is not None:
             custom_data["margin"] = margin_val
-    # predicted_ltv
     if cfg.get("append_pltv"):
         lo = float(cfg.get("pltv_min", 0.0))
         hi = float(cfg.get("pltv_max", max(lo, 0.0)))
@@ -310,7 +299,6 @@ def capi_post(server_events, cfg):
     if not CAPI_URL or not ACCESS_TOKEN:
         return {"skipped": True, "reason": "missing_capi_config"}
 
-    # Network chaos (latency + error)
     lat = int(cfg.get("net_capi_latency_ms", 0))
     if lat > 0: time.sleep(lat/1000.0)
     if rand_uniform(0.0, 1.0) < float(cfg.get("net_capi_error_rate", 0.0)):
@@ -341,10 +329,7 @@ def webhook_post(server_events, cfg):
 def ga4_post(mapped_events: List[Dict[str,Any]], cfg):
     if not cfg.get("enable_ga4"): return {"skipped": True}
     if not GA4_URL: return {"skipped": True, "reason":"missing_ga4_config"}
-    body = {
-        "client_id": str(uuid.uuid4()),
-        "events": mapped_events
-    }
+    body = {"client_id": str(uuid.uuid4()), "events": mapped_events}
     try:
         r = requests.post(GA4_URL, json=body, timeout=10)
         return {"status": r.status_code, "ok": r.ok, "text": r.text[:300]}
@@ -615,6 +600,29 @@ PAGE_HTML_BODY_PREFIX = """
       </div>
     </div>
 
+    <!-- NEW: Pixel Auto (browser-side) -->
+    <div class="card">
+      <h3>Pixel Auto (browser → Pixel)</h3>
+      <p class="small">Automatically fires Meta Pixel events from the browser. Respects Enable Pixel, currency/price nulls, mismatch, and event-ID toggles.</p>
+      <div class="row">
+        <label>Events/sec</label>
+        <input id="px_rps" type="number" step="0.1" min="0.1" value="0.5"/>
+      </div>
+      <div class="row">
+        <button id="pxStartBtn" class="btn" onclick="pixelAutoStart(this)">
+          Start
+          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
+          <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
+        </button>
+        <button id="pxStopBtn" class="btn" onclick="pixelAutoStop(this)" disabled>
+          Stop
+          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
+          <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
+        </button>
+      </div>
+      <p id="px_status" class="small">Stopped</p>
+    </div>
+
     <div class="card">
       <h3>Auto Stream (server → CAPI)</h3>
       <p class="small">Streams sessions to CAPI (and optional sinks). If <b>Enable CAPI</b> is off, nothing is sent.</p>
@@ -627,7 +635,8 @@ PAGE_HTML_BODY_PREFIX = """
           <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
         </button>
         <button id="stopBtn" class="btn" onclick="stopAuto(this)">Stop
-          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
+          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
+          <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
         </button>
       </div>
       <p id="status" class="small">…</p>
@@ -907,7 +916,46 @@ function sendPurchase(btn){
   sendPixel('Purchase', payload, {eventID: bad.null_event_id ? null : rid()}, btn);
 }
 
-// ----- Auto stream controls -----
+// ----- Pixel Auto Stream (browser -> Pixel) -----
+let __pxTimer = null;
+
+function pixelAutoTick(){
+  if (!ENABLE_PIXEL) return;
+  const r = Math.random();
+  if (r < 0.50)      { sendView(null); }
+  else if (r < 0.75) { sendATC(null); }
+  else if (r < 0.90) { sendInitiate(null); }
+  else               { sendPurchase(null); }
+}
+
+function pixelAutoStart(btn){
+  const rps = parseFloat(document.getElementById('px_rps').value || '0.5');
+  const interval = Math.max(50, 1000 / Math.max(0.1, rps));
+  if (__pxTimer) clearInterval(__pxTimer);
+  __pxTimer = setInterval(pixelAutoTick, interval);
+  document.getElementById('px_status').textContent = 'Running at ' + (Math.round((1000/interval)*100)/100) + ' events/sec';
+  document.getElementById('pxStartBtn').disabled = true;
+  document.getElementById('pxStopBtn').disabled = false;
+  flashIcon(btn, true);
+}
+
+function pixelAutoStop(btn){
+  if (__pxTimer) clearInterval(__pxTimer);
+  __pxTimer = null;
+  document.getElementById('px_status').textContent = 'Stopped';
+  document.getElementById('pxStartBtn').disabled = false;
+  document.getElementById('pxStopBtn').disabled = true;
+  flashIcon(btn, true);
+}
+
+function pxRefreshStatus(){
+  const running = !!__pxTimer;
+  document.getElementById('px_status').textContent = running ? 'Running' : 'Stopped';
+  document.getElementById('pxStartBtn').disabled = running;
+  document.getElementById('pxStopBtn').disabled = !running;
+}
+
+// ----- Auto stream controls (server) -----
 async function refreshStatus(){
   try {
     const j = await fetchJSON('/auto/status');
@@ -1141,6 +1189,7 @@ async function downloadReplay(){
 // ----- Init -----
 window.addEventListener('load', async () => {
   await loadConfig(); updatePreview(); refreshStatus(); pollMetrics(); refreshConsole();
+  pxRefreshStatus(); // initialize Pixel Auto controls
   if (document.getElementById('enable_pixel').checked) { try { fbq('track','PageView'); } catch(e){} }
 });
 </script>
