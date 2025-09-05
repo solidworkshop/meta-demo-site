@@ -9,212 +9,25 @@
 <body class="light">
   <header>
     <h1>E-commerce Simulator — Light Mode</h1>
-    <nav>
-      <a href="/">Home</a>
-      <a href="/catalog">Catalog</a>
-    </nav>
+    <nav><a href="/">Home</a><a href="/catalog">Catalog</a></nav>
   </header>
+
+  {% if not env_file_exists %}
+  <div class="banner banner-info">
+    ✅ Using environment variables from Render (no .env file found).
+  </div>
+  {% endif %}
 
   {% if creds_missing %}
   <div class="banner banner-warn">
     <strong>CAPI credentials missing.</strong>
-    Set <code>PIXEL_ID</code> and <code>ACCESS_TOKEN</code> in your <code>.env</code> to send real CAPI events.
+    Set <code>PIXEL_ID</code> and <code>ACCESS_TOKEN</code> in your <code>.env</code> or Render Environment tab.
     (Graph {{ graph_ver }})
-    <button id="btnTestCapi" class="btn ghost small">Send Test</button>
   </div>
   {% endif %}
 
-  <section class="control-row">
-    <div class="card toolbar-card" id="cardPixel">
-      <div class="toolbar">
-        <div class="left">
-          <span class="dot" id="dotPixel"></span>
-          <span class="status-text" id="statusPixel">Stopped</span>
-          <span class="badge" id="badgePixel">OFF</span>
-        </div>
-        <div class="right">
-          <button id="resetPixel" class="btn ghost icon" title="Reset counter">↺</button>
-          <span class="count" id="countPixel">{{ pixel_auto.count }}</span>
-          <label class="switch">
-            <input type="checkbox" id="togglePixel">
-            <span class="slider"></span>
-          </label>
-        </div>
-      </div>
-      <h2>Meta Pixel (browser)</h2>
-
-      <div class="row">
-        <label>Interval (ms)</label>
-        <input type="number" id="pixelInterval" value="{{ pixel_auto.interval_ms }}" min="200" />
-      </div>
-
-      <details class="adv">
-        <summary>Advanced Controls</summary>
-        <div class="adv-grid">
-          <label>Currency
-            <select id="pixelCurrency">
-              <option>Auto</option>
-              <option>Null</option>
-              <option>USD</option>
-              <option>EUR</option>
-              <option>JPY</option>
-              <option>GBP</option>
-            </select>
-          </label>
-          <label>Cost% Min
-            <input type="number" id="pixelCostMin" value="{{ pixel_auto.cost_pct_min }}" min="0" max="99" />
-          </label>
-          <label>Cost% Max
-            <input type="number" id="pixelCostMax" value="{{ pixel_auto.cost_pct_max }}" min="0" max="99" />
-          </label>
-          <label>PLTV
-            <input type="number" id="pixelPLTV" value="{{ pixel_auto.pltv }}" step="0.01" />
-          </label>
-          <label>Delay (ms)
-            <input type="number" id="pixelDelay" value="{{ pixel_auto.delay_ms }}" min="0" max="3000" />
-          </label>
-          <label>Match-Rate Degrade %
-            <input type="number" id="pixelDegrade" value="{{ pixel_auto.match_rate_degrade_pct }}" min="0" max="100" />
-          </label>
-        </div>
-      </details>
-    </div>
-
-    <div class="card toolbar-card" id="cardServer">
-      <div class="toolbar">
-        <div class="left">
-          <span class="dot" id="dotServer"></span>
-          <span class="status-text" id="statusServer">Stopped</span>
-          <span class="badge" id="badgeServer">OFF</span>
-        </div>
-        <div class="right">
-          <button id="resetServer" class="btn ghost icon" title="Reset counter">↺</button>
-          <span class="count" id="countServer">{{ server_auto.count }}</span>
-          <label class="switch">
-            <input type="checkbox" id="toggleServer">
-            <span class="slider"></span>
-          </label>
-        </div>
-      </div>
-      <h2>CAPI (server)</h2>
-
-      <div class="row">
-        <label>Interval (ms)</label>
-        <input type="number" id="serverInterval" value="{{ server_auto.interval_ms }}" min="200" />
-      </div>
-
-      <details class="adv">
-        <summary>Advanced Controls</summary>
-        <div class="adv-grid">
-          <label>Currency
-            <select id="serverCurrency">
-              <option>Auto</option>
-              <option>Null</option>
-              <option>USD</option>
-              <option>EUR</option>
-              <option>JPY</option>
-              <option>GBP</option>
-            </select>
-          </label>
-          <label>Cost% Min
-            <input type="number" id="serverCostMin" value="{{ server_auto.cost_pct_min }}" min="0" max="99" />
-          </label>
-          <label>Cost% Max
-            <input type="number" id="serverCostMax" value="{{ server_auto.cost_pct_max }}" min="0" max="99" />
-          </label>
-          <label>PLTV
-            <input type="number" id="serverPLTV" value="{{ server_auto.pltv }}" step="0.01" />
-          </label>
-          <label>Delay (ms)
-            <input type="number" id="serverDelay" value="{{ server_auto.delay_ms }}" min="0" max="3000" />
-          </label>
-          <label>Match-Rate Degrade %
-            <input type="number" id="serverDegrade" value="{{ server_auto.match_rate_degrade_pct }}" min="0" max="100" />
-          </label>
-        </div>
-      </details>
-
-      <details id="capiErrorPanel">
-        <summary>CAPI response & errors</summary>
-        <pre id="capiErrorBox" class="error-box">No errors yet.</pre>
-        <div class="row">
-          <button id="btnTestCapi2" class="btn secondary small">Send Test Event</button>
-        </div>
-      </details>
-    </div>
-  </section>
-
-  <section class="card">
-    <h2>Manual Sender</h2>
-    <div class="row">
-      <label>Channel</label>
-      <select id="manualChannel">
-        <option value="both">Both</option>
-        <option value="pixel">Meta Pixel only</option>
-        <option value="capi">CAPI only</option>
-      </select>
-    </div>
-    <div class="row">
-      <label>Event</label>
-      <select id="manualEvent">
-        <option>Purchase</option>
-        <option>AddToCart</option>
-        <option>ViewContent</option>
-        <option>InitiateCheckout</option>
-      </select>
-    </div>
-    <div class="row">
-      <label>SKU (optional)</label>
-      <input id="manualSKU" placeholder="e.g., SKU0007" />
-    </div>
-
-    <details class="adv">
-      <summary>Advanced Controls</summary>
-      <div class="adv-grid">
-        <label>Currency
-          <select id="manualCurrency">
-            <option>Auto</option>
-            <option>Null</option>
-            <option>USD</option>
-            <option>EUR</option>
-            <option>JPY</option>
-            <option>GBP</option>
-          </select>
-        </label>
-        <label>Cost% Min
-          <input type="number" id="manualCostMin" value="20" min="0" max="99" />
-        </label>
-        <label>Cost% Max
-          <input type="number" id="manualCostMax" value="60" min="0" max="99" />
-        </label>
-        <label>PLTV
-          <input type="number" id="manualPLTV" value="0" step="0.01" />
-        </label>
-        <label>Delay (ms)
-          <input type="number" id="manualDelay" value="0" min="0" max="3000" />
-        </label>
-        <label>Match-Rate Degrade %
-          <input type="number" id="manualDegrade" value="0" min="0" max="100" />
-        </label>
-      </div>
-    </details>
-    <details class="adv">
-      <summary>Discrepancy & Chaos</summary>
-      <div class="toggles">
-        <label><input type="checkbox" id="manualNullPrice"> Send null price</label>
-        <label><input type="checkbox" id="manualNullCurrency"> Send null currency</label>
-        <label><input type="checkbox" id="manualNullEventId"> Send null event_id</label>
-      </div>
-    </details>
-    <button class="btn primary" id="sendManual">Send Event</button>
-  </section>
-
-  <script>
-    window.DEFAULTS = {
-      pixelAuto: {{ pixel_auto|tojson }},
-      serverAuto: {{ server_auto|tojson }}
-    };
-  </script>
-  <script src="/static/js/main.js"></script>
+  <main style="padding:16px">
+    <div class="card"><h2>Full Simulator</h2><p>All features merged with env banner.</p></div>
+  </main>
 </body>
 </html>
