@@ -4,10 +4,10 @@
 # Margin (price - random cost) + PLTV values, currency control, file + webhook + GA4 sinks,
 # Event console, scenario runner, clock skew, health/version.
 import os, json, hashlib, time, threading, uuid, math, random
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from collections import deque, defaultdict
-from typing import Any, Dict, List, Optional
-from flask import Flask, request, Response, jsonify, has_request_context, send_file
+from typing import Any, Dict, List
+from flask import Flask, request, Response, jsonify, has_request_context
 import requests
 from dotenv import load_dotenv
 
@@ -80,16 +80,16 @@ CONFIG: Dict[str, Any] = {
     "seed": "",  # when set, RNG is seeded
 
     # discrepancy toggles
-    "mismatch_value_pct": 0.0,        # e.g. 0.15 -> ±15% applied to one channel (Pixel) when >0
-    "mismatch_currency": "NONE",      # NONE | PIXEL | CAPI (force currency to different or null)
-    "desync_event_id": False,         # if true, pixel uses a different event_id than capi
-    "duplicate_event_id_n": 0,        # 0 disables; else duplicate every Nth event_id on channel PIXEL
+    "mismatch_value_pct": 0.0,        # e.g. 0.15 -> ±15% applied to Pixel when >0
+    "mismatch_currency": "NONE",      # NONE | PIXEL | CAPI
+    "desync_event_id": False,         # pixel uses a different event_id than capi
+    "duplicate_event_id_n": 0,        # 0 disables; else duplicate every Nth Pixel event_id
     "drop_pixel_every_n": 0,          # drop every Nth Pixel event
     "lag_capi_seconds": 0.0,          # delay before sending to CAPI (simulate network lag)
 
     # chaos
     "net_capi_latency_ms": 0,         # artificial latency (per request)
-    "net_capi_error_rate": 0.0,       # 0..1 force HTTP error (simulate) after optional latency
+    "net_capi_error_rate": 0.0,       # 0..1 force HTTP error (simulate)
     "schema_remove_contents": False,
     "schema_empty_arrays": False,
     "schema_str_numbers": False,      # send numbers as strings
@@ -151,7 +151,6 @@ def _log_event(entry: Dict[str,Any]):
                 DEDUP["pixel_ids"].add(eid)
             elif ch == "capi":
                 DEDUP["capi_ids"].add(eid)
-            # recompute matched/pixel_only/capi_only cheaply
             common = DEDUP["pixel_ids"].intersection(DEDUP["capi_ids"])
             DEDUP["matched"] = len(common)
             DEDUP["pixel_only"] = len(DEDUP["pixel_ids"] - common)
@@ -267,18 +266,12 @@ def append_margin_pltv(custom_data, cfg, single_price=None, contents=None):
 
 # -------------------- Mapping sim → CAPI/GA4 helpers --------------------
 def _apply_currency_override(cur, cfg, channel="capi"):
-    # channel is used by mismatch toggles
     ov = (cfg.get("currency_override") or "AUTO").upper()
-    bad = {
-        "null_currency": cfg.get("null_currency", False)
-    }
-    # mismatch_currency override per-channel
     mm = (cfg.get("mismatch_currency") or "NONE").upper()
     if mm == "PIXEL" and channel == "pixel":
         return None if cur else "USD"
     if mm == "CAPI" and channel == "capi":
         return None if cur else "USD"
-
     if ov == "NULL":
         return None
     elif ov != "AUTO":
@@ -309,34 +302,6 @@ def _schema_mutations(custom_data, cfg):
 def _apply_clock_skew(ts_unix, cfg):
     skew = int(cfg.get("clock_skew_seconds", 0))
     return int(ts_unix + skew)
-
-def _mismatch_value(value, cfg, channel):
-    pct = float(cfg.get("mismatch_value_pct", 0.0))
-    if pct <= 0: return value
-    # apply only on Pixel to see dedup mismatches (common prod issue)
-    if channel != "pixel": return value
-    if value is None: return None
-    try:
-        delta = value * pct
-        return round(value + rand_uniform(-delta, delta), 2)
-    except Exception:
-        return value
-
-def _maybe_drop_pixel(cfg):
-    n = int(cfg.get("drop_pixel_every_n", 0) or 0)
-    if n <= 0: return False
-    COUNTS["__pixel_count"] += 1
-    return COUNTS["__pixel_count"] % n == 0
-
-def _maybe_duplicate_event_id(eid, cfg, channel):
-    if channel != "pixel": return eid
-    n = int(cfg.get("duplicate_event_id_n", 0) or 0)
-    if n <= 0: return eid
-    COUNTS["__dupe_idx"] += 1
-    if COUNTS["__dupe_idx"] % n == 0:
-        # reuse last known pixel id (if any) to simulate a dupe
-        return COUNTS.get("__last_pixel_eid", eid)
-    return eid
 
 # -------------------- Posting sinks --------------------
 def capi_post(server_events, cfg):
@@ -376,7 +341,6 @@ def webhook_post(server_events, cfg):
 def ga4_post(mapped_events: List[Dict[str,Any]], cfg):
     if not cfg.get("enable_ga4"): return {"skipped": True}
     if not GA4_URL: return {"skipped": True, "reason":"missing_ga4_config"}
-    # GA4 expects {"client_id": "x.y", "events":[{name, params:{}}]}
     body = {
         "client_id": str(uuid.uuid4()),
         "events": mapped_events
@@ -414,7 +378,6 @@ def _make_product(cfg):
     base = 10000
     size = max(1, int(cfg.get("product_catalog_size", 200)))
     n = base + _rng.randint(0, size - 1)
-    # Triangular distribution for price
     lo, hi = float(cfg["price_min"]), max(float(cfg["price_min"])+0.01, float(cfg["price_max"]))
     price = round(rand_triangular(lo, hi, (lo*0.7 + hi*0.3)), 2)
     cat = rand_choice(CATS)
@@ -438,7 +401,6 @@ def map_sim_event_to_capi(e, cfg):
     cur = ctx.get("currency","USD")
     cur = _apply_currency_override(cur, cfg, channel="capi")
 
-    # clock skew
     ts_unix = _apply_clock_skew(iso_to_unix(e["timestamp"]), cfg)
 
     page = e.get("page") or "/"
@@ -535,12 +497,10 @@ def map_sim_event_to_capi(e, cfg):
                         c["item_price"] = None
         ev["custom_data"] = cd
 
-    # convert types to strings if requested
     out = [_maybe_str_nums(ev, cfg) for ev in out]
     return out
 
 def map_sim_event_to_ga4(e, cfg) -> List[Dict[str,Any]]:
-    """Very light mapping for demo purposes."""
     et = e.get("event_type")
     events = []
     if et == "product_view":
@@ -612,18 +572,18 @@ function copyTxt(t){ navigator.clipboard.writeText(t).catch(()=>{}); }
 </script>
 """
 
-PAGE_HTML_BODY_PREFIX = f"""
+PAGE_HTML_BODY_PREFIX = """
 </head><body>
 <div class="container">
-  <h1>Demo Store Simulator <span class="small">v{APP_VERSION}</span></h1>
-  {banner_html()}
+  <h1>Demo Store Simulator <span class="small">v__APP_VERSION__</span></h1>
+  __BANNERS__
   <div class="topbar">
     <span class="badge" id="badge_pixel">Pixel: ?</span>
     <span class="badge" id="badge_capi">CAPI: ?</span>
-    <span class="badge" id="badge_test">Test Code: {"on" if TEST_EVENT_CODE else "off"}</span>
+    <span class="badge" id="badge_test">Test Code: __TEST_ONOFF__</span>
     <span class="badge" id="badge_seed">Seed: none</span>
     <span class="badge" id="badge_preset">Preset: Default</span>
-    <span class="badge" id="badge_ga4">GA4: {"on" if GA4_URL else "off"}</span>
+    <span class="badge" id="badge_ga4">GA4: __GA4_ONOFF__</span>
   </div>
 
   <div class="grid">
@@ -667,8 +627,7 @@ PAGE_HTML_BODY_PREFIX = f"""
           <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
         </button>
         <button id="stopBtn" class="btn" onclick="stopAuto(this)">Stop
-          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
-          <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
+          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
         </button>
       </div>
       <p id="status" class="small">…</p>
@@ -763,7 +722,7 @@ PAGE_HTML_BODY_PREFIX = f"""
       <div class="row"><label>Webhook sink</label><input id="enable_webhook" type="checkbox"/></div>
       <div class="row"><label>GA4 sink</label><input id="enable_ga4" type="checkbox"/></div>
       <div class="row"><button class="btn" onclick="saveConfig(this)">Save Controls</button></div>
-      <p class="small">File sink: {FILE_SINK_PATH or '(disabled)'} — writes NDJSON when set via env.</p>
+      <p class="small">File sink: __FILE_SINK_LABEL__</p>
       <div class="row"><button class="btn" onclick="downloadReplay()">Download Replay Bundle</button></div>
     </div>
 
@@ -790,56 +749,56 @@ PAGE_HTML_BODY_PREFIX = f"""
   </div>
 """
 
-PAGE_HTML_FOOT = f"""
+PAGE_HTML_FOOT = """
 <script>
 // ----- Pixel loader -----
-(function(){{
+(function(){
   var s=document.createElement('script'); s.async=true; s.src='https://connect.facebook.net/en_US/fbevents.js';
   document.head.appendChild(s);
-  window.fbq = window.fbq || function(){{ (fbq.q=fbq.q||[]).push(arguments); }};
+  window.fbq = window.fbq || function(){ (fbq.q=fbq.q||[]).push(arguments); };
   fbq.loaded=true; fbq.version='2.0'; fbq.queue=[];
-  fbq('init', '{PIXEL_ID}');
-}})();
+  fbq('init', '__PIXEL_ID__');
+})();
 
 // ----- UI helpers -----
-function readBadToggles(){{
-  return {{
+function readBadToggles(){
+  return {
     null_price: document.getElementById('null_price').checked,
     null_currency: document.getElementById('null_currency').checked,
     null_event_id: document.getElementById('null_event_id').checked,
-  }};
-}}
-function randBetween(a,b){{ const lo=Math.min(a,b), hi=Math.max(a,b); return lo + Math.random()*(hi-lo); }}
-function marginFromPrice(price, minPct, maxPct){{
+  };
+}
+function randBetween(a,b){ const lo=Math.min(a,b), hi=Math.max(a,b); return lo + Math.random()*(hi-lo); }
+function marginFromPrice(price, minPct, maxPct){
   const pct = randBetween(minPct, maxPct);
   const cost = Math.max(0, price * pct);
   return Math.max(0, Math.round((price - cost) * 100)/100);
-}}
-function attachMarginPltv(payload, price, cfg){{
-  if (document.getElementById('append_margin').checked){{
+}
+function attachMarginPltv(payload, price, cfg){
+  if (document.getElementById('append_margin').checked){
     let m = null;
-    if (Array.isArray(payload.contents) && payload.contents.length){{
+    if (Array.isArray(payload.contents) && payload.contents.length){
       m = 0;
       const lo = parseFloat(document.getElementById('cost_pct_min').value||'0.4');
       const hi = parseFloat(document.getElementById('cost_pct_max').value||'0.8');
-      for(const c of payload.contents) {{
+      for(const c of payload.contents) {
         if (typeof c.item_price === 'number') m += marginFromPrice(c.item_price, lo, hi) * (c.quantity||1);
-      }}
+      }
       m = Math.round(m*100)/100;
-    }} else if (typeof price === 'number') {{
+    } else if (typeof price === 'number') {
       const lo = parseFloat(document.getElementById('cost_pct_min').value||'0.4');
       const hi = parseFloat(document.getElementById('cost_pct_max').value||'0.8');
       m = marginFromPrice(price, lo, hi);
-    }}
+    }
     if (m != null) payload.margin = m;
-  }}
-  if (document.getElementById('append_pltv').checked){{
+  }
+  if (document.getElementById('append_pltv').checked){
     const lo = parseFloat(document.getElementById('pltv_min').value||'120');
     const hi = parseFloat(document.getElementById('pltv_max').value||'600');
     payload.predicted_ltv = Math.round(randBetween(lo,hi)*100)/100;
-  }}
-}}
-function currentCurrency(channel){{
+  }
+}
+function currentCurrency(channel){
   const mode = (document.getElementById('currency_override').value || 'AUTO').toUpperCase();
   const bad = readBadToggles();
   const mm = (document.getElementById('mismatch_currency').value||'NONE').toUpperCase();
@@ -848,199 +807,186 @@ function currentCurrency(channel){{
   if (bad.null_currency) return null;
   if (mode!=='AUTO') return mode;
   return 'USD';
-}}
+}
 
 // ----- Next-event preview -----
-function updatePreview(){{
+function updatePreview(){
   const price = 68.99, qty = 2, total = 149.02;
-  const p = {{ contents:[{{id:'SKU-10057',quantity:qty,item_price:price}}], currency: currentCurrency('pixel'), value: total }};
+  const p = { contents:[{id:'SKU-10057',quantity:qty,item_price:price}], currency: currentCurrency('pixel'), value: total };
   attachMarginPltv(p, null, null);
   document.getElementById('previewBox').textContent = JSON.stringify(p, null, 2);
-}}
+}
 
 // ----- Discrepancy helpers -----
-function maybeMismatchValue(val){{
+function maybeMismatchValue(val){
   const pct = parseFloat(document.getElementById('mismatch_value_pct').value||'0');
   if (!pct || !val) return val;
   const delta = val * pct;
   return Math.round((val + randBetween(-delta, delta))*100)/100;
-}}
-function maybeDesyncEventId(eid){{
+}
+function maybeDesyncEventId(eid){
   return document.getElementById('desync_event_id').checked ? eid + '_px' : eid;
-}}
-function maybeDropPixel(){{
+}
+function maybeDropPixel(){
   const n = parseInt(document.getElementById('drop_pixel_every_n').value||'0',10);
   if (!n) return false;
   window.__pxCount = (window.__pxCount||0) + 1;
   return window.__pxCount % n === 0;
-}}
-function maybeDupePixelId(eid){{
+}
+function maybeDupePixelId(eid){
   const n = parseInt(document.getElementById('duplicate_event_id_n').value||'0',10);
   if (!n) return eid;
   window.__dupeIdx = (window.__dupeIdx||0) + 1;
   if (window.__dupeIdx % n === 0) return (window.__lastPxEid || eid);
   window.__lastPxEid = eid;
   return eid;
-}}
+}
 
 // ----- Pixel send & server telemetry -----
 let ENABLE_PIXEL = true;
-async function sendPixel(name, payload, opts, btn){{
-  if (!ENABLE_PIXEL) {{ flashIcon(btn, false); return; }}
-  // Intended vs actual (diff)
+async function sendPixel(name, payload, opts, btn){
+  if (!ENABLE_PIXEL) { flashIcon(btn, false); return; }
   const intended = JSON.parse(JSON.stringify(payload));
-  // Apply discrepancies
   if ('value' in payload) payload.value = maybeMismatchValue(payload.value);
   const eid0 = (opts && opts.eventID) || rid();
   const eid = maybeDupePixelId(maybeDesyncEventId(eid0));
-  if (maybeDropPixel()) {{
-    // still log to server as "dropped"
-    await fetch('/metrics/pixel', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{event_name:name,intended, sent:payload, event_id:eid, dropped:true}})}}).catch(()=>{});
+  if (maybeDropPixel()) {
+    await fetch('/metrics/pixel', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({event_name:name,intended, sent:payload, event_id:eid, dropped:true})}).catch(()=>{});
     flashIcon(btn, true); return;
-  }}
-  try {{ fbq('track', name, payload, {{ eventID: eid }}); }} catch(e) {{}}
-  // Telemetry
-  await fetch('/metrics/pixel', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{event_name:name,intended, sent:payload, event_id:eid}})}}).catch(()=>{});
+  }
+  try { fbq('track', name, payload, { eventID: eid }); } catch(e) {}
+  await fetch('/metrics/pixel', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({event_name:name,intended, sent:payload, event_id:eid})}).catch(()=>{});
   flashIcon(btn, true);
-}}
+}
 
-function sendView(btn){{
+function sendView(btn){
   const bad = readBadToggles();
   const price = 68.99;
-  const payload = {{
+  const payload = {
     content_type:'product',
     content_ids:['SKU-10057'],
     currency: currentCurrency('pixel'),
     value: bad.null_price ? null : price
-  }};
+  };
   attachMarginPltv(payload, price);
-  sendPixel('ViewContent', payload, {{eventID: bad.null_event_id ? null : rid()}}, btn);
-}}
-function sendATC(btn){{
+  sendPixel('ViewContent', payload, {eventID: bad.null_event_id ? null : rid()}, btn);
+}
+function sendATC(btn){
   const bad = readBadToggles();
   const price = 68.99, qty = 1, value = qty*price;
-  const payload = {{
+  const payload = {
     content_type:'product',
     content_ids:['SKU-10057'],
-    contents:[{{id:'SKU-10057', quantity:qty, item_price: bad.null_price ? null : price}}],
+    contents:[{id:'SKU-10057', quantity:qty, item_price: bad.null_price ? null : price}],
     currency: currentCurrency('pixel'),
     value: bad.null_price ? null : value
-  }};
+  };
   attachMarginPltv(payload, null);
-  sendPixel('AddToCart', payload, {{eventID: bad.null_event_id ? null : rid()}}, btn);
-}}
-function sendInitiate(btn){{
+  sendPixel('AddToCart', payload, {eventID: bad.null_event_id ? null : rid()}, btn);
+}
+function sendInitiate(btn){
   const bad = readBadToggles();
   const price = 68.99, qty = 2, total = 149.02;
-  const payload = {{
-    contents:[{{id:'SKU-10057', quantity:qty, item_price: bad.null_price ? null : price}}],
+  const payload = {
+    contents:[{id:'SKU-10057', quantity:qty, item_price: bad.null_price ? null : price}],
     currency: currentCurrency('pixel'),
     value: bad.null_price ? null : total
-  }};
+  };
   attachMarginPltv(payload, null);
-  sendPixel('InitiateCheckout', payload, {{eventID: bad.null_event_id ? null : rid()}}, btn);
-}}
-function sendPurchase(btn){{
+  sendPixel('InitiateCheckout', payload, {eventID: bad.null_event_id ? null : rid()}, btn);
+}
+function sendPurchase(btn){
   const bad = readBadToggles();
   const price = 68.99, qty = 2, total = 149.02;
-  const payload = {{
-    contents:[{{id:'SKU-10057', quantity:qty, item_price: bad.null_price ? null : price}}],
+  const payload = {
+    contents:[{id:'SKU-10057', quantity:qty, item_price: bad.null_price ? null : price}],
     currency: currentCurrency('pixel'),
     value: bad.null_price ? null : total
-  }};
+  };
   attachMarginPltv(payload, null);
-  sendPixel('Purchase', payload, {{eventID: bad.null_event_id ? null : rid()}}, btn);
-}}
+  sendPixel('Purchase', payload, {eventID: bad.null_event_id ? null : rid()}, btn);
+}
 
 // ----- Auto stream controls -----
-async function refreshStatus(){{
-  try {{
+async function refreshStatus(){
+  try {
     const j = await fetchJSON('/auto/status');
     document.getElementById('status').textContent = j.running ? ('Running at '+j.rps+' sessions/sec') : 'Stopped';
     document.getElementById('startBtn').disabled = j.running;
     document.getElementById('stopBtn').disabled = !j.running;
     if (j.running) document.getElementById('rps').value = j.rps;
-  }} catch(e){{ document.getElementById('status').textContent = 'Unknown'; }}
-}}
-async function startAuto(btn){{
+  } catch(e){ document.getElementById('status').textContent = 'Unknown'; }
+}
+async function startAuto(btn){
   const rps = parseFloat(document.getElementById('rps').value||'0.5');
   const ok = await fetchOK('/auto/start?rps='+encodeURIComponent(rps));
   flashIcon(btn, ok); setTimeout(refreshStatus, 250);
-}}
-async function stopAuto(btn){{
+}
+async function stopAuto(btn){
   const ok = await fetchOK('/auto/stop'); flashIcon(btn, ok); setTimeout(refreshStatus, 250);
-}}
+}
 
 // ----- Presets & Seed -----
-async function saveSeed(btn){{
+async function saveSeed(btn){
   const seed = document.getElementById('seed').value||'';
-  const ok = await fetchOK('/config/seed', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify({{seed}})}}); 
+  const ok = await fetchOK('/config/seed', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({seed})}); 
   flashIcon(btn, ok); updateBadges();
-}}
-async function savePreset(btn){{
+}
+async function savePreset(btn){
   const name = document.getElementById('preset_name').value||'Preset';
-  const ok = await fetchOK('/presets/save?name='+encodeURIComponent(name), {{method:'POST'}});
+  const ok = await fetchOK('/presets/save?name='+encodeURIComponent(name), {method:'POST'});
   flashIcon(btn, ok); updateBadges();
-}}
-async function loadPreset(btn){{
+}
+async function loadPreset(btn){
   const name = document.getElementById('preset_name').value||'Preset';
-  const ok = await fetchOK('/presets/load?name='+encodeURIComponent(name), {{method:'POST'}});
+  const ok = await fetchOK('/presets/load?name='+encodeURIComponent(name), {method:'POST'});
   flashIcon(btn, ok); await loadConfig();
-}}
-async function exportPreset(btn){{
+}
+async function exportPreset(btn){
   const name = document.getElementById('preset_name').value||'Preset';
   const j = await fetchJSON('/presets/export?name='+encodeURIComponent(name));
-  const blob = new Blob([JSON.stringify(j,null,2)], {{type:'application/json'}});
+  const blob = new Blob([JSON.stringify(j,null,2)], {type:'application/json'});
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = (j.name||'preset')+'.json'; a.click();
-}}
-document.getElementById('import_preset').addEventListener('change', async (e)=>{{
+}
+document.getElementById('import_preset').addEventListener('change', async (e)=>{
   const f = e.target.files[0]; if(!f) return;
   const text = await f.text();
-  await fetch('/presets/import', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:text}});
+  await fetch('/presets/import', {method:'POST', headers:{'Content-Type':'application/json'}, body:text});
   await loadConfig(); updateBadges();
-}});
-async function resetDefaults(btn){{
-  const ok = await fetchOK('/presets/reset', {{method:'POST'}});
+});
+async function resetDefaults(btn){
+  const ok = await fetchOK('/presets/reset', {method:'POST'});
   flashIcon(btn, ok); await loadConfig();
-}}
+}
 
 // ----- Config I/O -----
-async function loadConfig(){{
+async function loadConfig(){
   const cfg = await fetchJSON('/auto/config');
-  // master
   ENABLE_PIXEL = !!cfg.enable_pixel;
   document.getElementById('enable_pixel').checked = ENABLE_PIXEL;
   document.getElementById('enable_capi').checked = !!cfg.enable_capi;
-  // traffic
   document.getElementById('rps').value = cfg.rps;
   document.getElementById('p_add_to_cart').value = cfg.p_add_to_cart;
   document.getElementById('p_begin_checkout').value = cfg.p_begin_checkout;
   document.getElementById('p_purchase').value = cfg.p_purchase;
-  // catalog/pricing
   document.getElementById('product_catalog_size').value = cfg.product_catalog_size;
   document.getElementById('price_min').value = cfg.price_min;
   document.getElementById('price_max').value = cfg.price_max;
-  // currency
   document.getElementById('currency_override').value = (cfg.currency_override||'AUTO');
-  // economics
   document.getElementById('free_shipping_threshold').value = cfg.free_shipping_threshold;
   document.getElementById('shipping_options').value = (cfg.shipping_options||[]).join(', ');
   document.getElementById('tax_rate').value = cfg.tax_rate;
-  // bad
   document.getElementById('null_price').checked = !!cfg.null_price;
   document.getElementById('null_currency').checked = !!cfg.null_currency;
   document.getElementById('null_event_id').checked = !!cfg.null_event_id;
-  // margin + pltv
   document.getElementById('append_margin').checked = !!cfg.append_margin;
   document.getElementById('cost_pct_min').value = cfg.cost_pct_min;
   document.getElementById('cost_pct_max').value = cfg.cost_pct_max;
   document.getElementById('append_pltv').checked = !!cfg.append_pltv;
   document.getElementById('pltv_min').value = cfg.pltv_min;
   document.getElementById('pltv_max').value = cfg.pltv_max;
-  // seed & preset
   document.getElementById('seed').value = cfg.seed||'';
   document.getElementById('preset_name').value = cfg.active_preset||'';
-  // discrepancy & chaos
   document.getElementById('mismatch_value_pct').value = cfg.mismatch_value_pct||0;
   document.getElementById('mismatch_currency').value = (cfg.mismatch_currency||'NONE');
   document.getElementById('desync_event_id').checked = !!cfg.desync_event_id;
@@ -1054,17 +1000,17 @@ async function loadConfig(){{
   document.getElementById('schema_str_numbers').checked = !!cfg.schema_str_numbers;
   document.getElementById('schema_unknown_fields').checked = !!cfg.schema_unknown_fields;
   document.getElementById('clock_skew_seconds').value = cfg.clock_skew_seconds||0;
-  document.getElementById('kill_PageView').checked = !!(cfg.kill_event_types||{{}})["PageView"];
-  document.getElementById('kill_ViewContent').checked = !!(cfg.kill_event_types||{{}})["ViewContent"];
-  document.getElementById('kill_AddToCart').checked = !!(cfg.kill_event_types||{{}})["AddToCart"];
-  document.getElementById('kill_InitiateCheckout').checked = !!(cfg.kill_event_types||{{}})["InitiateCheckout"];
-  document.getElementById('kill_Purchase').checked = !!(cfg.kill_event_types||{{}})["Purchase"];
+  document.getElementById('kill_PageView').checked = !!(cfg.kill_event_types||{})["PageView"];
+  document.getElementById('kill_ViewContent').checked = !!(cfg.kill_event_types||{})["ViewContent"];
+  document.getElementById('kill_AddToCart').checked = !!(cfg.kill_event_types||{})["AddToCart"];
+  document.getElementById('kill_InitiateCheckout').checked = !!(cfg.kill_event_types||{})["InitiateCheckout"];
+  document.getElementById('kill_Purchase').checked = !!(cfg.kill_event_types||{})["Purchase"];
   document.getElementById('enable_webhook').checked = !!cfg.enable_webhook;
   document.getElementById('enable_ga4').checked = !!cfg.enable_ga4;
   updateBadges(); updatePreview();
-}}
-async function saveConfig(btn){{
-  const body = {{
+}
+async function saveConfig(btn){
+  const body = {
     enable_pixel: document.getElementById('enable_pixel').checked,
     enable_capi: document.getElementById('enable_capi').checked,
     rps: parseFloat(document.getElementById('rps').value||'0.5'),
@@ -1100,60 +1046,60 @@ async function saveConfig(btn){{
     schema_str_numbers: document.getElementById('schema_str_numbers').checked,
     schema_unknown_fields: document.getElementById('schema_unknown_fields').checked,
     clock_skew_seconds: parseInt(document.getElementById('clock_skew_seconds').value||'0',10),
-    kill_event_types: {{
+    kill_event_types: {
       PageView: document.getElementById('kill_PageView').checked,
       ViewContent: document.getElementById('kill_ViewContent').checked,
       AddToCart: document.getElementById('kill_AddToCart').checked,
       InitiateCheckout: document.getElementById('kill_InitiateCheckout').checked,
       Purchase: document.getElementById('kill_Purchase').checked,
-    }},
+    },
     enable_webhook: document.getElementById('enable_webhook').checked,
     enable_ga4: document.getElementById('enable_ga4').checked,
-  }};
-  const ok = await fetchOK('/auto/config', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body: JSON.stringify(body)}});
+  };
+  const ok = await fetchOK('/auto/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   flashIcon(btn, ok);
   if (ok) setTimeout(refreshStatus, 250);
   updateBadges(); updatePreview();
-}}
-function updateBadges(){{
-  fetchJSON('/auto/config').then(cfg => {{
+}
+function updateBadges(){
+  fetchJSON('/auto/config').then(cfg => {
     document.getElementById('badge_pixel').textContent = 'Pixel: ' + (cfg.enable_pixel?'on':'off');
     document.getElementById('badge_capi').textContent  = 'CAPI: ' + (cfg.enable_capi?'on':'off');
     document.getElementById('badge_seed').textContent  = 'Seed: ' + (cfg.seed?cfg.seed:'none');
     document.getElementById('badge_preset').textContent= 'Preset: ' + (cfg.active_preset||'Default');
-  }}).catch(()=>{});
-}}
+  }).catch(()=>{});
+}
 
 // ----- Metrics polling (spark + dedup) -----
 const sparkSent = document.getElementById('spark_sent').getContext('2d');
 const sparkPur  = document.getElementById('spark_pur').getContext('2d');
 let sA=[], sB=[];
-function drawSpark(ctx, arr){{
+function drawSpark(ctx, arr){
   ctx.clearRect(0,0,120,36);
   if(!arr.length) return;
   const max=Math.max(...arr,1), min=Math.min(...arr,0);
   ctx.beginPath();
-  arr.forEach((v,i)=>{{
+  arr.forEach((v,i)=>{
     const x=i*(120/Math.max(1,arr.length-1));
     const y=36 - ((v-min)/(max-min||1))*34 - 1;
     if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
-  }});
+  });
   ctx.strokeStyle='#9bd';
   ctx.stroke();
-}}
-async function pollMetrics(){{
-  try {{
+}
+async function pollMetrics(){
+  try {
     const m = await fetchJSON('/metrics');
     sA.push(m.sent_total||0); if (sA.length>30) sA=sA.slice(-30);
     sB.push(m.purchases||0); if (sB.length>30) sB=sB.slice(-30);
     drawSpark(sparkSent, sA); drawSpark(sparkPur, sB);
     document.getElementById('dedup').textContent = `Dedup matched: ${m.dedup.matched} | pixel-only: ${m.dedup.pixel_only} | capi-only: ${m.dedup.capi_only}`;
-  }} catch(e) {{}}
-}}
+  } catch(e) {}
+}
 setInterval(pollMetrics, 1000);
 
 // ----- Event console -----
-async function refreshConsole(btn){{
+async function refreshConsole(btn){
   const ch = document.getElementById('f_channel').value;
   const ty = document.getElementById('f_type').value;
   const ok = document.getElementById('f_ok').value;
@@ -1161,51 +1107,65 @@ async function refreshConsole(btn){{
   const j = await fetchJSON('/api/events?'+q.toString());
   const rows = j.items.map(r => `
     <tr>
-      <td class="small">${{r.ts}}</td>
-      <td>${{r.channel}}</td>
-      <td>${{r.event_name||''}}</td>
-      <td class="small">${{r.ok?'ok':'err'}}</td>
-      <td class="small"><button class="btn" onclick='copyTxt(JSON.stringify({{intended: r.intended, sent:r.sent}}, null, 2))'>Copy</button></td>
-      <td class="small"><button class="btn" onclick='alert(JSON.stringify(r.response||{{}}, null, 2))'>Resp</button></td>
+      <td class="small">${r.ts}</td>
+      <td>${r.channel}</td>
+      <td>${r.event_name||''}</td>
+      <td class="small">${r.ok?'ok':'err'}</td>
+      <td class="small"><button class="btn" onclick='copyTxt(JSON.stringify({intended: r.intended, sent:r.sent}, null, 2))'>Copy</button></td>
+      <td class="small"><button class="btn" onclick='alert(JSON.stringify(r.response||{}, null, 2))'>Resp</button></td>
     </tr>
   `).join('');
   document.getElementById('console_table').innerHTML = `
     <table class="table">
       <thead><tr><th>time</th><th>channel</th><th>type</th><th>status</th><th>payload</th><th>resp</th></tr></thead>
-      <tbody>${{rows}}</tbody>
+      <tbody>${rows}</tbody>
     </table>`;
-}}
+}
 
 // ----- Scenario runner -----
-async function runScenario(btn){{
+async function runScenario(btn){
   const text = document.getElementById('scenario_text').value||'';
   document.getElementById('scenario_status').textContent = 'Running...';
-  const ok = await fetchOK('/scenario/run', {{method:'POST', headers:{{'Content-Type':'application/json'}}, body:text}});
+  const ok = await fetchOK('/scenario/run', {method:'POST', headers:{'Content-Type':'application/json'}, body:text});
   flashIcon(btn, ok);
   document.getElementById('scenario_status').textContent = ok ? 'Scenario started.' : 'Error.';
-}}
+}
 
 // ----- Replay -----
-async function downloadReplay(){{
+async function downloadReplay(){
   const j = await fetchJSON('/replay/export');
-  const blob = new Blob([JSON.stringify(j,null,2)], {{type:'application/json'}});
+  const blob = new Blob([JSON.stringify(j,null,2)], {type:'application/json'});
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'replay_bundle.json'; a.click();
-}}
+}
 
 // ----- Init -----
-window.addEventListener('load', async () => {{
+window.addEventListener('load', async () => {
   await loadConfig(); updatePreview(); refreshStatus(); pollMetrics(); refreshConsole();
-  if (document.getElementById('enable_pixel').checked) {{ try {{ fbq('track','PageView'); }} catch(e){{}} }}
-}});
+  if (document.getElementById('enable_pixel').checked) { try { fbq('track','PageView'); } catch(e){} }
+});
 </script>
-<noscript><img height="1" width="1" style="display:none" src="https://www.facebook.com/tr?id={PIXEL_ID}&ev=PageView&noscript=1"/></noscript>
+<noscript><img height="1" width="1" style="display:none" src="https://www.facebook.com/tr?id=__PIXEL_ID__&ev=PageView&noscript=1"/></noscript>
 </div></body></html>
 """
 
 # -------------------- Routes: HTML --------------------
 @app.route("/")
 def home():
-    html = PAGE_HTML_HEAD + PAGE_HTML_BODY_PREFIX + PAGE_HTML_FOOT
+    banners = banner_html()
+    test_onoff = "on" if TEST_EVENT_CODE else "off"
+    ga4_onoff = "on" if GA4_URL else "off"
+    file_sink_label = FILE_SINK_PATH if FILE_SINK_PATH else "(disabled — set FILE_SINK_PATH env)"
+    html = (
+        PAGE_HTML_HEAD
+        + PAGE_HTML_BODY_PREFIX
+            .replace("__APP_VERSION__", APP_VERSION)
+            .replace("__BANNERS__", banners)
+            .replace("__TEST_ONOFF__", test_onoff)
+            .replace("__GA4_ONOFF__", ga4_onoff)
+            .replace("__FILE_SINK_LABEL__", file_sink_label)
+        + PAGE_HTML_FOOT
+            .replace("__PIXEL_ID__", PIXEL_ID or "")
+    )
     return Response(html, mimetype="text/html")
 
 # -------------------- Metrics endpoints --------------------
@@ -1216,13 +1176,11 @@ def metrics_pixel():
         body = request.get_json(force=True) or {}
     except Exception:
         return {"ok": False}, 400
-    cfg = get_cfg_snapshot()
     name = body.get("event_name","")
     intended = body.get("intended") or {}
     sent = body.get("sent") or {}
     eid = body.get("event_id")
     dropped = bool(body.get("dropped"))
-    # diff (very light)
     diff = {"value": {"intended": intended.get("value"), "sent": sent.get("value")},
             "currency": {"intended": intended.get("currency"), "sent": sent.get("currency")}}
     entry = {
@@ -1365,25 +1323,14 @@ def _event_base(session, **extra):
     }
 
 def _send_one_through_sinks(sim_evt, cfg):
-    """Map to CAPI/GA4, honor lag, and post to sinks. Log telemetry."""
-    name_map = {
-        "page_view": "PageView",
-        "product_view": "ViewContent",
-        "add_to_cart": "AddToCart",
-        "begin_checkout": "InitiateCheckout",
-        "purchase": "Purchase",
-        "return_initiated": "ReturnInitiated"
-    }
     capi_events = map_sim_event_to_capi(sim_evt, cfg)
     ga4_events  = map_sim_event_to_ga4(sim_evt, cfg) if cfg.get("enable_ga4") else []
 
-    # Kill switches per event type
     kill = cfg.get("kill_event_types", {})
     for ev in capi_events:
         if kill.get(ev.get("event_name",""), False):
             return
 
-    # Optional lag before posting to CAPI/Webhook/GA4
     lag = float(cfg.get("lag_capi_seconds", 0.0))
     if lag > 0: time.sleep(max(0.0, lag))
 
@@ -1401,7 +1348,6 @@ def _send_one_through_sinks(sim_evt, cfg):
             resp = {"error": str(e)}
             ok = False
 
-        # log capi event(s)
         for ev in capi_events:
             entry = {
                 "ts": now_iso(), "channel":"capi", "event_name": ev.get("event_name"),
