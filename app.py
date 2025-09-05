@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
 """
-E-commerce Simulator — Toggles V2 (UX polish)
-- .env support
-- Option A fix (STATE["default_catalog_size"])
-- Pixel Auto + CAPI Auto:
-  - Toggle signifiers (persisted)
-  - Animated border glow while running
-  - Traffic indicator dot
-  - Inline status text
-  - Event counters persisted server-side
+E-commerce Simulator — UX Polish v3
+- Removes Master Switches (per spec)
+- Renames: "Meta Pixel (browser)" and "CAPI (server)"
+- Persistent toggles & counters
+- Button polish and toolbar UI
+- CAPI reliability improvements and inline error viewer support
 """
 import os, json, time, uuid, random, hashlib, threading
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 import requests
 from flask import Flask, request, jsonify, render_template, redirect, url_for
 from dotenv import load_dotenv
@@ -33,9 +30,20 @@ def capi_url() -> Optional[str]:
 
 app = Flask(__name__)
 
-STATE = {
-    "master": {"pixel_enabled": True, "capi_enabled": True},
+STATE: Dict[str, Any] = {
     "catalog": {},
+    "pixel_auto": {
+        "running": False,
+        "interval_ms": 2000,
+        "bad_nulls": {"price": False, "currency": False, "event_id": False},
+        "cost_pct_min": 20,
+        "cost_pct_max": 60,
+        "currency": "Auto",
+        "delay_ms": 0,
+        "match_rate_degrade_pct": 0,
+        "pltv": 0.0,
+        "count": 0
+    },
     "server_auto": {
         "running": False,
         "interval_ms": 2000,
@@ -50,27 +58,15 @@ STATE = {
         "pltv": 0.0,
         "count": 0
     },
-    "pixel_auto": {
-        "running": False,
-        "interval_ms": 2000,
-        "bad_nulls": {"price": False, "currency": False, "event_id": False},
-        "cost_pct_min": 20,
-        "cost_pct_max": 60,
-        "currency": "Auto",
-        "delay_ms": 0,
-        "match_rate_degrade_pct": 0,
-        "pltv": 0.0,
-        "count": 0
-    },
     "default_catalog_size": DEFAULT_CATALOG_SIZE,
+    "last_capi_error": None,  # for inline viewer
 }
 
 CATALOG_LOCK = threading.Lock()
 
 def ensure_catalog(size: int) -> None:
     with CATALOG_LOCK:
-        current = len(STATE["catalog"])
-        if current == size:
+        if len(STATE["catalog"]) == size:
             return
         STATE["catalog"] = {}
         for i in range(size):
@@ -88,11 +84,17 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 def rand_user_data(degrade_pct: int) -> Dict[str, Any]:
+    """Include hashed identifiers unless degrade_pct forces removal. Always supply fallback match keys."""
     include_ids = random.randint(1,100) > degrade_pct
-    ud = {}
+    ud: Dict[str, Any] = {}
     if include_ids:
         ud["external_id"] = hashlib.sha256(f"user-{uuid.uuid4()}".encode()).hexdigest()
         ud["em"] = hashlib.sha256(f"user{random.randint(1000,9999)}@example.com".encode()).hexdigest()
+    # Fallback match keys to meet CAPI requirements
+    ua = request.headers.get("User-Agent", "Mozilla/5.0 Simulator")
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr or "127.0.0.1")
+    ud["client_user_agent"] = ua
+    ud["client_ip_address"] = ip
     return ud
 
 def compute_margin(price: Optional[float], cost_min: int, cost_max: int) -> Optional[float]:
@@ -109,31 +111,6 @@ def pick_currency(sel: str) -> Optional[str]:
 
 def maybe(value, bad_flag):
     return None if bad_flag else value
-
-def send_pixel_stub(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return {"ok": True, "kind": "pixel", "echo": payload}
-
-def send_capi(payload: Dict[str, Any]) -> Dict[str, Any]:
-    url = capi_url()
-    if not STATE["master"]["capi_enabled"]:
-        return {"ok": False, "error": "CAPI disabled by master switch."}
-    if not url:
-        return {"ok": True, "kind": "capi-simulated", "echo": payload, "note": "PIXEL_ID/ACCESS_TOKEN not set"}
-    try:
-        resp = requests.post(
-            url,
-            json=payload,
-            params={"access_token": ACCESS_TOKEN, **({"test_event_code": TEST_EVENT_CODE} if TEST_EVENT_CODE else {})},
-            timeout=10,
-        )
-        ok = resp.status_code == 200
-        try:
-            body = resp.json() if resp.content else {}
-        except Exception:
-            body = {"raw_text": resp.text}
-        return {"ok": ok, "status": resp.status_code, "body": body}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
 
 def build_event(event_name: str, item: Dict[str, Any], controls: Dict[str, Any]) -> Dict[str, Any]:
     price = item.get("price")
@@ -173,28 +150,64 @@ def build_event(event_name: str, item: Dict[str, Any], controls: Dict[str, Any])
         }]
     }
 
+def send_pixel_stub(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {"ok": True, "kind": "pixel", "echo": payload}
+
+def send_capi(payload: Dict[str, Any]) -> Dict[str, Any]:
+    url = capi_url()
+    if not url:
+        STATE["last_capi_error"] = {"reason": "missing_creds", "message": "PIXEL_ID or ACCESS_TOKEN not set."}
+        return {"ok": True, "kind": "capi-simulated", "echo": payload, "note": "Missing creds; simulated."}
+    try:
+        params = {"access_token": ACCESS_TOKEN}
+        if TEST_EVENT_CODE:
+            params["test_event_code"] = TEST_EVENT_CODE
+        resp = requests.post(
+            url,
+            json=payload,
+            params=params,
+            timeout=15,
+            headers={"User-Agent": "Simulator/1.0 (+events)", "Content-Type": "application/json"},
+        )
+        ok = resp.status_code == 200
+        try:
+            body = resp.json() if resp.content else {}
+        except Exception:
+            body = {"raw_text": resp.text}
+        if not ok:
+            STATE["last_capi_error"] = {"reason": "http_error", "status": resp.status_code, "body": body, "url": url}
+        return {"ok": ok, "status": resp.status_code, "body": body, "graph_url": url}
+    except Exception as e:
+        STATE["last_capi_error"] = {"reason": "exception", "message": str(e), "url": url}
+        return {"ok": False, "error": str(e), "graph_url": url}
+
 # ---------------- ROUTES ----------------
 @app.get("/")
 def index():
     ensure_catalog(STATE["default_catalog_size"])
+    creds_missing = not (PIXEL_ID and ACCESS_TOKEN)
     return render_template("index.html",
-        pixel_enabled=STATE["master"]["pixel_enabled"],
-        capi_enabled=STATE["master"]["capi_enabled"],
         default_catalog_size=STATE["default_catalog_size"],
         pixel_auto=STATE["pixel_auto"],
-        server_auto=STATE["server_auto"],
+        server_auto={k:v for k,v in STATE["server_auto"].items() if k != "thread"},
+        creds_missing=creds_missing,
+        graph_ver=GRAPH_VER,
     )
 
 @app.get("/api/status")
 def api_status():
-    # return state for both autos (excluding thread object)
-    sa = {k:v for k,v in STATE["server_auto"].items() if k != "thread"}
-    return jsonify({"ok": True, "pixel_auto": STATE["pixel_auto"], "server_auto": sa})
+    return jsonify({
+        "ok": True,
+        "pixel_auto": STATE["pixel_auto"],
+        "server_auto": {k:v for k,v in STATE["server_auto"].items() if k != "thread"},
+        "last_capi_error": STATE.get("last_capi_error"),
+        "creds_missing": not (PIXEL_ID and ACCESS_TOKEN),
+        "graph_ver": GRAPH_VER
+    })
 
 @app.post("/api/pixel_auto/set")
 def api_pixel_auto_set():
     data = request.json or {}
-    # update persistent settings
     for k in ("running","interval_ms","bad_nulls","cost_pct_min","cost_pct_max","currency","delay_ms","match_rate_degrade_pct","pltv","count"):
         if k in data:
             STATE["pixel_auto"][k] = data[k]
@@ -202,7 +215,6 @@ def api_pixel_auto_set():
 
 @app.post("/api/pixel_auto/increment")
 def api_pixel_auto_increment():
-    # client calls this after a Pixel send to persist count
     STATE["pixel_auto"]["count"] += 1
     return jsonify({"ok": True, "count": STATE["pixel_auto"]["count"]})
 
@@ -244,8 +256,7 @@ def _server_auto_loop():
             "pltv": STATE["server_auto"]["pltv"],
         }
         ensure_catalog(STATE["default_catalog_size"])
-        with CATALOG_LOCK:
-            item = random.choice(list(STATE["catalog"].values()))
+        item = random.choice(list(STATE["catalog"].values()))
         payload = build_event("Purchase", item, controls)
         send_capi(payload)
         STATE["server_auto"]["count"] += 1
@@ -257,12 +268,18 @@ def api_server_auto_reset_count():
     STATE["server_auto"]["count"] = 0
     return jsonify({"ok": True, "count": 0})
 
-@app.post("/api/master")
-def api_master():
-    data = request.json or {}
-    STATE["master"]["pixel_enabled"] = bool(data.get("pixel_enabled", STATE["master"]["pixel_enabled"]))
-    STATE["master"]["capi_enabled"] = bool(data.get("capi_enabled", STATE["master"]["capi_enabled"]))
-    return jsonify({"ok": True, "master": STATE["master"]})
+@app.post("/api/capi/test")
+def api_capi_test():
+    """Send a small known-good payload for connectivity testing."""
+    ensure_catalog(STATE["default_catalog_size"])
+    # Use the first item to construct a payload
+    item = next(iter(STATE["catalog"].values()))
+    payload = build_event("Purchase", item, {
+        "currency": "USD", "bad_nulls": {"price": False, "currency": False, "event_id": False},
+        "cost_pct_min": 30, "cost_pct_max": 40, "delay_ms": 0, "match_rate_degrade_pct": 0, "pltv": 0
+    })
+    res = send_capi(payload)
+    return jsonify({"ok": res.get("ok", False), "raw": res})
 
 @app.post("/api/catalog/size")
 def api_catalog_size():
@@ -282,17 +299,12 @@ def api_manual_send():
     sku = data.get("sku")
 
     ensure_catalog(STATE["default_catalog_size"])
-    with CATALOG_LOCK:
-        item = STATE["catalog"].get(sku) if sku else random.choice(list(STATE["catalog"].values()))
-
+    item = STATE["catalog"].get(sku) if sku else random.choice(list(STATE["catalog"].values()))
     payload = build_event(event_name, item, controls)
 
     results = []
     if channel in ("pixel", "both"):
-        if not STATE["master"]["pixel_enabled"]:
-            results.append({"ok": False, "error": "Pixel disabled by master switch."})
-        else:
-            results.append(send_pixel_stub(payload))
+        results.append(send_pixel_stub(payload))
     if channel in ("capi", "both"):
         results.append(send_capi(payload))
 
@@ -302,15 +314,13 @@ def api_manual_send():
 @app.get("/catalog")
 def catalog():
     ensure_catalog(STATE["default_catalog_size"])
-    with CATALOG_LOCK:
-        items = list(STATE["catalog"].values())
+    items = list(STATE["catalog"].values())
     return render_template("catalog.html", items=items)
 
 @app.get("/product/<sku>")
 def product(sku):
     ensure_catalog(STATE["default_catalog_size"])
-    with CATALOG_LOCK:
-        item = STATE["catalog"].get(sku)
+    item = STATE["catalog"].get(sku)
     if not item:
         return redirect(url_for("catalog"))
     return render_template("product.html", item=item)
