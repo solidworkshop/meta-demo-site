@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # Flask app: Demo page (Meta Pixel + buttons), /ingest (CAPI forwarder),
 # Auto streamer (server-side CAPI), Advanced Controls with descriptions,
-# Bad-data toggles, Margin + PLTV appends, Product catalog size control,
-# and master switches to enable/disable Pixel & CAPI.
+# Bad-data toggles, Profit Margin (price - random cost) appends,
+# Product catalog size, master switches for Pixel & CAPI, Currency dropdown.
 import os, json, hashlib, time, random, uuid, threading
 from datetime import datetime, timezone
 from flask import Flask, request, Response, jsonify, has_request_context
@@ -34,6 +34,12 @@ CONFIG = {
     "price_min": 10.0,
     "price_max": 120.0,
 
+    # currency control
+    # AUTO  = use session currency (randomized for CAPI, Pixel falls back to USD)
+    # NULL  = send currency null
+    # other = specific code like USD/EUR/GBP/AUD/CAD/JPY
+    "currency_override": "AUTO",
+
     # order economics
     "free_shipping_threshold": 75.0,
     "shipping_options": [4.99, 6.99, 9.99],
@@ -50,7 +56,10 @@ CONFIG = {
 
     # extras
     "append_margin": True,        # add "margin" to custom_data
-    "margin_rate": 0.35,          # margin = merchandise_subtotal * margin_rate
+    # NEW: Profit margin config — cost is random % of price
+    "cost_pct_min": 0.40,         # 40% of price
+    "cost_pct_max": 0.80,         # 80% of price
+
     "append_pltv": True,          # add "predicted_ltv" to custom_data
     "pltv_min": 120.0,
     "pltv_max": 600.0,
@@ -67,7 +76,6 @@ def iso_to_unix(ts_iso):
 
 def capi_post(server_events):
     if not get_cfg_snapshot()["enable_capi"]:
-        # simulate "no-op" when disabled
         return {"skipped": True, "reason": "enable_capi=false"}
     payload = {"data": server_events}
     if TEST_EVENT_CODE:
@@ -100,24 +108,59 @@ def get_cfg_snapshot():
     with CONFIG_LOCK:
         return dict(CONFIG)
 
-def append_margin_pltv(custom_data, cfg, fallback_value=None, contents=None):
-    """Append margin and predicted_ltv if enabled."""
+def _rand_cost(price, cfg):
+    """Random cost draw as % of price; returns a non-negative cost."""
+    try:
+        p = float(price)
+    except Exception:
+        return None
+    lo = max(0.0, float(cfg.get("cost_pct_min", 0.4)))
+    hi = max(lo, float(cfg.get("cost_pct_max", 0.8)))
+    pct = random.uniform(lo, hi)
+    return max(0.0, round(p * pct, 2))
+
+def _margin_from_contents(contents, cfg):
+    """Sum margin across line items: (price - random_cost) * qty, clamped >= 0."""
+    total = 0.0
+    for c in contents or []:
+        try:
+            price = float(c.get("item_price"))
+            qty   = float(c.get("quantity", 1))
+        except Exception:
+            continue
+        cost = _rand_cost(price, cfg)
+        if cost is None:
+            continue
+        m = max(0.0, price - cost) * max(0.0, qty)
+        total += m
+    return round(total, 2)
+
+def append_margin_pltv(custom_data, cfg, single_price=None, contents=None):
+    """
+    Append:
+      - margin: profit = price - random_cost (per line; summed for contents)
+      - predicted_ltv: random in [pltv_min, pltv_max]
+    """
     if custom_data is None:
         custom_data = {}
 
-    subtotal = None
-    if contents:
-        subtotal = contents_subtotal(contents)
-    elif fallback_value is not None:
-        try:
-            subtotal = float(fallback_value)
-        except Exception:
-            subtotal = None
+    # margin
+    if cfg.get("append_margin"):
+        margin_val = None
+        if contents:
+            margin_val = _margin_from_contents(contents, cfg)
+        elif single_price is not None:
+            try:
+                price = float(single_price)
+                cost = _rand_cost(price, cfg)
+                if cost is not None:
+                    margin_val = round(max(0.0, price - cost), 2)
+            except Exception:
+                pass
+        if margin_val is not None:
+            custom_data["margin"] = margin_val
 
-    if cfg.get("append_margin") and subtotal is not None:
-        mr = max(0.0, float(cfg.get("margin_rate", 0.0)))
-        custom_data["margin"] = round(mr * max(0.0, subtotal), 2)
-
+    # predicted_ltv (PLTV)
     if cfg.get("append_pltv"):
         lo = float(cfg.get("pltv_min", 0.0))
         hi = float(cfg.get("pltv_max", max(lo, 0.0)))
@@ -153,9 +196,17 @@ def map_sim_event_to_capi(e):
     et   = e.get("event_type")
     sess = e.get("user", {})
     ctx  = e.get("context", {})
-    currency = ctx.get("currency","USD")
-    ts   = iso_to_unix(e["timestamp"])
     cfg  = get_cfg_snapshot()
+
+    # choose currency honoring override
+    cur = ctx.get("currency","USD")
+    ov = (cfg.get("currency_override") or "AUTO").upper()
+    if ov == "NULL":
+        cur = None
+    elif ov != "AUTO":
+        cur = ov  # specific code like USD/EUR/...
+
+    ts   = iso_to_unix(e["timestamp"])
 
     # infer a URL
     page = e.get("page") or "/"
@@ -191,9 +242,9 @@ def map_sim_event_to_capi(e):
             "content_type":"product",
             "content_ids":[p["product_id"]],
             "value": float(p["price"]),
-            "currency": currency
+            "currency": cur
         }
-        cd = append_margin_pltv(cd, cfg, fallback_value=cd["value"], contents=None)
+        cd = append_margin_pltv(cd, cfg, single_price=cd["value"], contents=None)
         out = [{**base, "event_name":"ViewContent", "custom_data": cd}]
 
     elif et == "add_to_cart":
@@ -204,9 +255,9 @@ def map_sim_event_to_capi(e):
             "content_ids":[li["product_id"]],
             "contents": contents,
             "value": float(li["qty"]) * float(li["price"]),
-            "currency": currency
+            "currency": cur
         }
-        cd = append_margin_pltv(cd, cfg, fallback_value=cd["value"], contents=contents)
+        cd = append_margin_pltv(cd, cfg, single_price=None, contents=contents)
         out = [{**base, "event_name":"AddToCart", "custom_data": cd}]
 
     elif et == "begin_checkout":
@@ -216,9 +267,9 @@ def map_sim_event_to_capi(e):
         cd = {
             "contents": contents,
             "value": total,
-            "currency": currency
+            "currency": cur
         }
-        cd = append_margin_pltv(cd, cfg, fallback_value=contents_subtotal(contents), contents=contents)
+        cd = append_margin_pltv(cd, cfg, single_price=None, contents=contents)
         out = [{**base, "event_name":"InitiateCheckout", "custom_data": cd}]
 
     elif et == "purchase":
@@ -228,9 +279,9 @@ def map_sim_event_to_capi(e):
         cd = {
             "contents": contents,
             "value": total,
-            "currency": currency
+            "currency": cur
         }
-        cd = append_margin_pltv(cd, cfg, fallback_value=contents_subtotal(contents), contents=contents)
+        cd = append_margin_pltv(cd, cfg, single_price=None, contents=contents)
         out = [{**base, "event_name":"Purchase", "custom_data": cd}]
 
     elif et == "return_initiated":
@@ -238,9 +289,9 @@ def map_sim_event_to_capi(e):
         cd = {
             "content_type":"product",
             "content_ids":[pid] if pid else [],
-            "value": 0.0, "currency": currency
+            "value": 0.0, "currency": cur
         }
-        cd = append_margin_pltv(cd, cfg, fallback_value=0.0, contents=None)
+        cd = append_margin_pltv(cd, cfg, single_price=0.0, contents=None)
         out = [{**base, "event_name":"ReturnInitiated", "custom_data": cd}]
 
     # Apply bad-data toggles before returning
@@ -258,7 +309,7 @@ PAGE_HTML = f"""<!doctype html>
   .card {{ border:1px solid var(--bd); border-radius:12px; padding:16px; }}
   .row {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }}
   .col {{ display:flex; flex-direction:column; gap:8px; }}
-  input[type=number], input[type=text] {{ width: 180px; padding:6px 8px; }}
+  input[type=number], input[type=text], select {{ width: 180px; padding:6px 8px; }}
   .small {{ font-size: 12px; color: var(--muted); }}
   .help {{ font-size: 12px; color: var(--muted); margin: -4px 0 6px 0; }}
 
@@ -287,7 +338,7 @@ PAGE_HTML = f"""<!doctype html>
   hr {{ width:100%; border:none; border-top:1px solid var(--bd); margin:8px 0; }}
 </style>
 <script>
-// We'll load the Pixel script but only fire events when enable_pixel=true from /auto/config
+// Load Pixel library; only fire when enable_pixel=true
 (function(){
   var s=document.createElement('script');
   s.async=true; s.src='https://connect.facebook.net/en_US/fbevents.js';
@@ -330,23 +381,60 @@ function readBadToggles(){
 function readAppendControls(){
   return {
     append_margin: document.getElementById('append_margin').checked,
-    margin_rate: parseFloat(document.getElementById('margin_rate').value || '0.35'),
+    cost_pct_min: parseFloat(document.getElementById('cost_pct_min').value || '0.4'),
+    cost_pct_max: parseFloat(document.getElementById('cost_pct_max').value || '0.8'),
     append_pltv: document.getElementById('append_pltv').checked,
     pltv_min: parseFloat(document.getElementById('pltv_min').value || '120'),
     pltv_max: parseFloat(document.getElementById('pltv_max').value || '600'),
   };
 }
 function randBetween(a,b){ const lo=Math.min(a,b), hi=Math.max(a,b); return lo + Math.random()*(hi-lo); }
-function attachMarginPltv(payload, valueForMargin){
+
+/* Margin calculators (client) */
+function marginFromPrice(price, minPct, maxPct){
+  // margin = price - random_cost ; cost = pct * price
+  const pct = randBetween(minPct, maxPct);
+  const cost = Math.max(0, price * pct);
+  return Math.max(0, Math.round((price - cost) * 100) / 100);
+}
+function marginFromContents(contents, minPct, maxPct){
+  if (!Array.isArray(contents)) return 0;
+  let total = 0;
+  for (const c of contents){
+    const price = typeof c.item_price === 'number' ? c.item_price : null;
+    const qty   = typeof c.quantity === 'number' ? c.quantity : 1;
+    if (price == null) continue;
+    total += marginFromPrice(price, minPct, maxPct) * Math.max(0, qty);
+  }
+  return Math.round(total * 100) / 100;
+}
+
+/* Attach margin + PLTV into payload */
+function attachMarginPltv(payload, singlePriceOrNull){
   const a = readAppendControls();
-  if (a.append_margin && typeof valueForMargin === 'number'){
-    const mr = Math.max(0, a.margin_rate || 0);
-    payload.margin = Math.round(valueForMargin * mr * 100)/100;
+  if (a.append_margin){
+    let m = null;
+    if (Array.isArray(payload.contents) && payload.contents.length){
+      m = marginFromContents(payload.contents, a.cost_pct_min, a.cost_pct_max);
+    } else if (typeof singlePriceOrNull === 'number'){
+      m = marginFromPrice(singlePriceOrNull, a.cost_pct_min, a.cost_pct_max);
+    }
+    if (m != null) payload.margin = m;
   }
   if (a.append_pltv){
     const pltv = randBetween(a.pltv_min||0, a.pltv_max||0);
     payload.predicted_ltv = Math.round(pltv*100)/100;
   }
+}
+
+/* Currency helper (Pixel side) */
+function currentCurrency(){
+  const mode = (document.getElementById('currency_override').value || 'AUTO').toUpperCase();
+  const bad = readBadToggles();
+  if (mode === 'NULL') return null;
+  if (bad.null_currency) return null;
+  if (mode !== 'AUTO') return mode;
+  return 'USD'; // Pixel fallback when Auto
 }
 
 /* Pixel event buttons (honor ENABLE_PIXEL) */
@@ -360,7 +448,7 @@ function sendView(btn){
   const payload = {
     content_type:'product',
     content_ids:['SKU-10057'],
-    currency: bad.null_currency ? null : 'USD',
+    currency: currentCurrency(),
     value: bad.null_price ? null : price
   };
   attachMarginPltv(payload, price);
@@ -374,34 +462,34 @@ function sendATC(btn){
     content_type:'product',
     content_ids:['SKU-10057'],
     contents:[{id:'SKU-10057', quantity:qty, item_price: bad.null_price ? null : price}],
-    currency: bad.null_currency ? null : 'USD',
+    currency: currentCurrency(),
     value: bad.null_price ? null : value
   };
-  attachMarginPltv(payload, value);
+  attachMarginPltv(payload, null);
   const ok = maybeSendPixel('AddToCart', payload, { eventID: bad.null_event_id ? null : rid() });
   flashIcon(btn, ok);
 }
 function sendInitiate(btn){
   const bad = readBadToggles();
-  const price = 68.99, qty = 2, subtotal = qty*price, total = 149.02;
+  const price = 68.99, qty = 2, total = 149.02;
   const payload = {
     contents:[{id:'SKU-10057', quantity:qty, item_price: bad.null_price ? null : price}],
-    currency: bad.null_currency ? null : 'USD',
+    currency: currentCurrency(),
     value: bad.null_price ? null : total
   };
-  attachMarginPltv(payload, subtotal);
+  attachMarginPltv(payload, null);
   const ok = maybeSendPixel('InitiateCheckout', payload, { eventID: bad.null_event_id ? null : rid() });
   flashIcon(btn, ok);
 }
 function sendPurchase(btn){
   const bad = readBadToggles();
-  const price = 68.99, qty = 2, subtotal = qty*price, total = 149.02;
+  const price = 68.99, qty = 2, total = 149.02;
   const payload = {
     contents:[{id:'SKU-10057', quantity:qty, item_price: bad.null_price ? null : price}],
-    currency: bad.null_currency ? null : 'USD',
+    currency: currentCurrency(),
     value: bad.null_price ? null : total
   };
-  attachMarginPltv(payload, subtotal);
+  attachMarginPltv(payload, null);
   const ok = maybeSendPixel('Purchase', payload, { eventID: bad.null_event_id ? null : rid() });
   flashIcon(btn, ok);
 }
@@ -441,7 +529,7 @@ async function loadConfig(){
     document.getElementById('enable_pixel').checked = ENABLE_PIXEL;
     document.getElementById('enable_capi').checked = !!cfg.enable_capi;
 
-    // initial PageView only when Pixel enabled
+    // send initial PageView only if Pixel enabled
     if (ENABLE_PIXEL) { try { fbq('track', 'PageView'); } catch(e){} }
 
     // traffic
@@ -455,6 +543,9 @@ async function loadConfig(){
     document.getElementById('price_min').value = cfg.price_min;
     document.getElementById('price_max').value = cfg.price_max;
 
+    // currency
+    document.getElementById('currency_override').value = (cfg.currency_override || 'AUTO');
+
     // economics
     document.getElementById('free_shipping_threshold').value = cfg.free_shipping_threshold;
     document.getElementById('shipping_options').value = (cfg.shipping_options || []).join(', ');
@@ -467,7 +558,8 @@ async function loadConfig(){
 
     // margin + PLTV
     document.getElementById('append_margin').checked = !!cfg.append_margin;
-    document.getElementById('margin_rate').value = cfg.margin_rate;
+    document.getElementById('cost_pct_min').value = cfg.cost_pct_min;
+    document.getElementById('cost_pct_max').value = cfg.cost_pct_max;
     document.getElementById('append_pltv').checked = !!cfg.append_pltv;
     document.getElementById('pltv_min').value = cfg.pltv_min;
     document.getElementById('pltv_max').value = cfg.pltv_max;
@@ -490,6 +582,9 @@ async function saveConfig(btn){
     price_min: parseFloat(document.getElementById('price_min').value || '10'),
     price_max: parseFloat(document.getElementById('price_max').value || '120'),
 
+    // currency
+    currency_override: document.getElementById('currency_override').value || 'AUTO',
+
     // economics
     free_shipping_threshold: parseFloat(document.getElementById('free_shipping_threshold').value || '75'),
     shipping_options: (document.getElementById('shipping_options').value || '')
@@ -503,7 +598,8 @@ async function saveConfig(btn){
 
     // margin + PLTV
     append_margin: document.getElementById('append_margin').checked,
-    margin_rate: parseFloat(document.getElementById('margin_rate').value || '0.35'),
+    cost_pct_min: parseFloat(document.getElementById('cost_pct_min').value || '0.4'),
+    cost_pct_max: parseFloat(document.getElementById('cost_pct_max').value || '0.8'),
     append_pltv: document.getElementById('append_pltv').checked,
     pltv_min: parseFloat(document.getElementById('pltv_min').value || '120'),
     pltv_max: parseFloat(document.getElementById('pltv_max').value || '600'),
@@ -513,7 +609,6 @@ async function saveConfig(btn){
     headers: {'Content-Type':'application/json'},
     body: JSON.stringify(body)
   });
-  // Update ENABLE_PIXEL immediately so buttons reflect the new choice
   ENABLE_PIXEL = body.enable_pixel;
   flashIcon(btn, ok);
   if (ok) setTimeout(refreshStatus, 250);
@@ -526,7 +621,7 @@ window.addEventListener('load', () => { refreshStatus(); loadConfig(); });
 </head>
 <body>
   <h1>Demo Store</h1>
-  <p class="small">Use the controls below to send browser (Pixel) and server (CAPI) events. You can also simulate bad data and append margin/PLTV.</p>
+  <p class="small">Profit margin now = <b>price − random cost</b>. Control cost% range below. Currency (incl. Null), Pixel/CAPI switches, bad-data, PLTV, and other settings are supported.</p>
 
   <div class="grid">
     <!-- Pixel test buttons -->
@@ -591,6 +686,21 @@ window.addEventListener('load', () => { refreshStatus(); loadConfig(); });
       <hr/>
 
       <div class="kv">
+        <label for="currency_override">Currency sent</label>
+        <select id="currency_override">
+          <option value="AUTO">Auto (session default)</option>
+          <option value="USD">USD</option>
+          <option value="EUR">EUR</option>
+          <option value="GBP">GBP</option>
+          <option value="AUD">AUD</option>
+          <option value="CAD">CAD</option>
+          <option value="JPY">JPY</option>
+          <option value="NULL">Null</option>
+        </select>
+      </div>
+      <p class="help">Select which currency to put on events. <b>Auto</b>: CAPI uses random session currency; Pixel defaults to USD. <b>Null</b>: sends currency as null.</p>
+
+      <div class="kv">
         <label for="product_catalog_size">Product catalog size</label>
         <input id="product_catalog_size" type="number" step="1" min="1" value="200"/>
       </div>
@@ -650,21 +760,27 @@ window.addEventListener('load', () => { refreshStatus(); loadConfig(); });
       <p class="help">For testing data quality: sets monetary fields to null.</p>
 
       <div class="toggle"><input id="null_currency" type="checkbox"/><label for="null_currency">Send <b>null currency</b></label></div>
-      <p class="help">For testing data quality: removes ISO currency code from events.</p>
+      <p class="help">For testing data quality: removes ISO currency code from events. Note: the Currency dropdown’s <b>Null</b> also forces null.</p>
 
       <div class="toggle"><input id="null_event_id" type="checkbox"/><label for="null_event_id">Send <b>null event_id</b></label></div>
       <p class="help">For testing de-duplication/diagnostics: sends no event_id.</p>
 
       <hr/>
 
-      <div class="toggle"><input id="append_margin" type="checkbox" checked/><label for="append_margin">Append <b>margin</b></label></div>
-      <p class="help">Calculates margin = merchandise subtotal × margin rate. Useful for profit analytics.</p>
+      <div class="toggle"><input id="append_margin" type="checkbox" checked/><label for="append_margin">Append <b>margin</b> (profit)</label></div>
+      <p class="help">Profit per item or order: <code>margin = price − cost</code>, where cost is a random percentage of price between the values below. For carts and purchases, margins are summed across items.</p>
 
       <div class="kv">
-        <label for="margin_rate">Margin rate (0–1)</label>
-        <input id="margin_rate" type="number" step="0.01" min="0" max="1" value="0.35"/>
+        <label for="cost_pct_min">Cost % Min (0–1)</label>
+        <input id="cost_pct_min" type="number" step="0.01" min="0" max="1" value="0.4"/>
       </div>
-      <p class="help">Higher margin rate → larger margin values on events.</p>
+      <p class="help">Lower bound for the random cost percentage. Example 0.4 means cost can be at least 40% of price.</p>
+
+      <div class="kv">
+        <label for="cost_pct_max">Cost % Max (0–1)</label>
+        <input id="cost_pct_max" type="number" step="0.01" min="0" max="1" value="0.8"/>
+      </div>
+      <p class="help">Upper bound for the random cost percentage. Ensure Max ≥ Min. Higher values shrink margins on average.</p>
 
       <div class="toggle"><input id="append_pltv" type="checkbox" checked/><label for="append_pltv">Append <b>predicted_ltv</b> (PLTV)</label></div>
       <p class="help">Adds a randomized predicted lifetime value between the min/max below.</p>
@@ -737,10 +853,12 @@ def _to_bool(v, default=False):
     if isinstance(v, bool):
         return v
     if isinstance(v, (int, float)):
-        return v != 0
+            return v != 0
     if isinstance(v, str):
         return v.strip().lower() in ("1","true","t","yes","y","on")
     return default
+
+_ALLOWED_CURRENCIES = {"AUTO","NULL","USD","EUR","GBP","AUD","CAD","JPY"}
 
 @app.route("/auto/config", methods=["GET", "POST"])
 def auto_config():
@@ -773,9 +891,13 @@ def auto_config():
         if "price_min" in body:
             CONFIG["price_min"] = _clampf(body["price_min"], 0.0, 1e6, CONFIG["price_min"])
         if "price_max" in body:
-            # ensure max >= min + tiny epsilon
             min_ok = max(0.01, CONFIG["price_min"])
             CONFIG["price_max"] = _clampf(body["price_max"], min_ok, 1e6, CONFIG["price_max"])
+
+        # currency
+        if "currency_override" in body:
+            v = str(body["currency_override"]).upper()
+            CONFIG["currency_override"] = v if v in _ALLOWED_CURRENCIES else CONFIG["currency_override"]
 
         # economics
         if "free_shipping_threshold" in body:
@@ -800,11 +922,15 @@ def auto_config():
             if b in body:
                 CONFIG[b] = _to_bool(body[b], CONFIG[b])
 
-        # margin + PLTV
+        # margin (profit) + PLTV
         if "append_margin" in body:
             CONFIG["append_margin"] = _to_bool(body["append_margin"], CONFIG["append_margin"])
-        if "margin_rate" in body:
-            CONFIG["margin_rate"] = _clampf(body["margin_rate"], 0.0, 1.0, CONFIG["margin_rate"])
+        if "cost_pct_min" in body:
+            CONFIG["cost_pct_min"] = _clampf(body["cost_pct_min"], 0.0, 1.0, CONFIG["cost_pct_min"])
+        if "cost_pct_max" in body:
+            # ensure max >= min
+            proposed = _clampf(body["cost_pct_max"], CONFIG["cost_pct_min"], 1.0, CONFIG["cost_pct_max"])
+            CONFIG["cost_pct_max"] = max(proposed, CONFIG["cost_pct_min"])
         if "append_pltv" in body:
             CONFIG["append_pltv"] = _to_bool(body["append_pltv"], CONFIG["append_pltv"])
         if "pltv_min" in body:
@@ -822,7 +948,7 @@ _stop_evt = threading.Event()
 DEVICES   = ["mobile","mobile","desktop","tablet"]
 SOURCES   = ["direct","seo","sem","email","social","referral"]
 COUNTRIES = ["US","US","US","CA","GB","DE","AU"]
-CURRENCIES= ["USD","USD","USD","EUR","GBP","AUD","CAD"]
+CURRENCIES= ["USD","USD","USD","EUR","GBP","AUD","CAD","JPY"]
 
 def _uid(): return str(uuid.uuid4())
 def _now_iso(): return datetime.now(tz=timezone.utc).isoformat()
@@ -841,7 +967,6 @@ def _make_session():
     }
 
 def _make_product(cfg):
-    # Choose a product ID within the configured catalog size window
     base = 10000
     size = max(1, int(cfg.get("product_catalog_size", 200)))
     n = base + random.randint(0, size - 1)
@@ -928,9 +1053,6 @@ def _auto_loop():
         try:
             if cfg.get("enable_capi"):
                 _send_simulated_session_once(cfg)
-            else:
-                # If CAPI disabled, just idle respecting rps so CPU stays low
-                pass
         except Exception:
             pass
         delay = max(0.05, 1.0 / max(0.1, cfg["rps"]))
