@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Flask app: Demo page (Meta Pixel + buttons), /ingest (CAPI forwarder),
-# and a Start/Stop auto streamer that sends server-side CAPI events.
+# Start/Stop auto streamer (server-side CAPI events), and inline success/failure UI.
 import os, json, hashlib, time, random, uuid, threading
 from datetime import datetime, timezone
 from flask import Flask, request, Response, jsonify, has_request_context
@@ -135,34 +135,39 @@ def map_sim_event_to_capi(e):
 
     return []
 
-# ---------- HTML (with checkmark-in-button feedback) ----------
+# ---------- HTML (with green check on success, red X on error) ----------
 PAGE_HTML = f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>Demo Store</title>
 <style>
-  :root {{ --bd:#ddd; --fg:#222; --muted:#555; --ok:#0a8a30; }}
+  :root {{ --bd:#ddd; --fg:#222; --muted:#555; --ok:#0a8a30; --err:#b00020; }}
   body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 2rem; color: var(--fg); }}
   .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }}
   .card {{ border:1px solid var(--bd); border-radius:12px; padding:16px; }}
   .row {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }}
   input[type=number] {{ width: 120px; padding:6px 8px; }}
   .small {{ font-size: 12px; color: var(--muted); }}
+
   .btn {{
     position: relative; padding: 8px 36px 8px 12px;
     border-radius: 10px; border:1px solid var(--bd);
     background:#fff; cursor:pointer; line-height:1.1;
   }}
   .btn:disabled {{ opacity: .6; cursor: not-allowed; }}
-  .btn .tick {{
+
+  .btn .tick, .btn .x {{
     position:absolute; right:10px; top:50%;
     transform: translateY(-50%) scale(0.8);
     opacity:0; transition: opacity .18s ease, transform .18s ease;
-    pointer-events:none; color: var(--ok);
-    display:inline-flex; align-items:center; justify-content:center;
+    pointer-events:none; display:inline-flex; align-items:center; justify-content:center;
   }}
+  .btn .tick {{ color: var(--ok); }}
+  .btn .x    {{ color: var(--err); }}
+  .btn .tick svg, .btn .x svg {{ width:18px; height:18px; }}
+
   .btn.show-tick .tick {{ opacity:1; transform: translateY(-50%) scale(1); }}
-  .btn .tick svg {{ width:18px; height:18px; }}
+  .btn.show-err  .x    {{ opacity:1; transform: translateY(-50%) scale(1); }}
 </style>
 <script>
 /* Meta Pixel */
@@ -176,21 +181,22 @@ fbq('track', 'PageView');
 
 /* Helpers */
 function rid(){{ return 'evt_' + Math.random().toString(36).slice(2) + Date.now().toString(36); }}
-function flashCheck(btn) {{
+function flashIcon(btn, ok) {{
   if (!btn) return;
-  btn.classList.add('show-tick');
-  setTimeout(()=> btn.classList.remove('show-tick'), 900);
+  const cls = ok ? 'show-tick' : 'show-err';
+  btn.classList.add(cls);
+  setTimeout(()=> btn.classList.remove(cls), 1100);
 }}
-async function safeFetch(url, opts) {{
+async function fetchOK(url, opts) {{
   try {{ const r = await fetch(url, opts); return r.ok; }} catch (_) {{ return false; }}
 }}
 
-/* Pixel event buttons - pass the clicked button as 'this' */
+/* Pixel event buttons: assume success (no network confirmation available) */
 function sendView(btn){{
   fbq('track', 'ViewContent', {{
     content_type:'product', content_ids:['SKU-10057'], currency:'USD', value:68.99
   }}, {{eventID: rid()}});
-  flashCheck(btn);
+  flashIcon(btn, true);
 }}
 function sendATC(btn){{
   fbq('track', 'AddToCart', {{
@@ -198,21 +204,21 @@ function sendATC(btn){{
     contents:[{{id:'SKU-10057', quantity:1, item_price:68.99}}],
     currency:'USD', value:68.99
   }}, {{eventID: rid()}});
-  flashCheck(btn);
+  flashIcon(btn, true);
 }}
 function sendInitiate(btn){{
   fbq('track', 'InitiateCheckout', {{
     contents:[{{id:'SKU-10057', quantity:2, item_price:68.99}}],
     currency:'USD', value:149.02
   }}, {{eventID: rid()}});
-  flashCheck(btn);
+  flashIcon(btn, true);
 }}
 function sendPurchase(btn){{
   fbq('track', 'Purchase', {{
     contents:[{{id:'SKU-10057', quantity:2, item_price:68.99}}],
     currency:'USD', value:149.02
   }}, {{eventID: rid()}});
-  flashCheck(btn);
+  flashIcon(btn, true);
 }}
 
 /* Auto streamer controls (server → CAPI) */
@@ -230,16 +236,14 @@ async function refreshStatus(){{
 }}
 async function startAuto(btn){{
   const rps = parseFloat(document.getElementById('rps').value || '0.5');
-  if (await safeFetch('/auto/start?rps=' + encodeURIComponent(rps))) {{
-    flashCheck(btn);
-    setTimeout(refreshStatus, 250);
-  }}
+  const ok  = await fetchOK('/auto/start?rps=' + encodeURIComponent(rps));
+  flashIcon(btn, ok);
+  setTimeout(refreshStatus, 250);
 }}
 async function stopAuto(btn){{
-  if (await safeFetch('/auto/stop')) {{
-    flashCheck(btn);
-    setTimeout(refreshStatus, 250);
-  }}
+  const ok = await fetchOK('/auto/stop');
+  flashIcon(btn, ok);
+  setTimeout(refreshStatus, 250);
 }}
 window.addEventListener('load', refreshStatus);
 </script>
@@ -258,6 +262,9 @@ window.addEventListener('load', refreshStatus);
         <span class="tick" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg>
         </span>
+        <span class="x" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg>
+        </span>
       </button>
     </div>
 
@@ -267,6 +274,9 @@ window.addEventListener('load', refreshStatus);
         Send AddToCart
         <span class="tick" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg>
+        </span>
+        <span class="x" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg>
         </span>
       </button>
     </div>
@@ -278,6 +288,9 @@ window.addEventListener('load', refreshStatus);
         <span class="tick" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg>
         </span>
+        <span class="x" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg>
+        </span>
       </button>
     </div>
 
@@ -287,6 +300,9 @@ window.addEventListener('load', refreshStatus);
         Send Purchase
         <span class="tick" aria-hidden="true">
           <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg>
+        </span>
+        <span class="x" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg>
         </span>
       </button>
     </div>
@@ -303,11 +319,17 @@ window.addEventListener('load', refreshStatus);
           <span class="tick" aria-hidden="true">
             <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg>
           </span>
+          <span class="x" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg>
+          </span>
         </button>
         <button id="stopBtn" class="btn" onclick="stopAuto(this)">
           Stop
           <span class="tick" aria-hidden="true">
             <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg>
+          </span>
+          <span class="x" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg>
           </span>
         </button>
       </div>
@@ -491,4 +513,3 @@ if __name__ == "__main__":
     # local run (Render uses gunicorn with PORT env)
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=True)
-
