@@ -8,15 +8,23 @@ import os, json, time, uuid, random, hashlib, threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List
 from flask import Flask, request, Response, jsonify, redirect, url_for
+import requests
+from dotenv import load_dotenv
 
 # --------------------------- ENV / CONST ---------------------------
+load_dotenv()  # <-- ensures .env is loaded when running locally
+
 PIXEL_ID        = os.getenv("PIXEL_ID", "")
 ACCESS_TOKEN    = os.getenv("ACCESS_TOKEN", "")
 TEST_EVENT_CODE = os.getenv("TEST_EVENT_CODE", "")
 GRAPH_VER       = os.getenv("GRAPH_VER", "v20.0")
 BASE_URL        = os.getenv("BASE_URL", "http://127.0.0.1:5000")
-CAPI_URL        = f"https://graph.facebook.com/{GRAPH_VER}/{PIXEL_ID}/events" if PIXEL_ID else None
-APP_VERSION     = "3.0.1"
+
+# Only construct CAPI_URL when BOTH PIXEL_ID and ACCESS_TOKEN are present
+CAPI_URL        = (f"https://graph.facebook.com/{GRAPH_VER}/{PIXEL_ID}/events"
+                   if PIXEL_ID and ACCESS_TOKEN else None)
+
+APP_VERSION     = "3.0.2"
 
 app = Flask(__name__)
 
@@ -83,7 +91,7 @@ CONFIG: Dict[str, Any] = {
         "null_price": False,
         "null_currency": False,
         "null_event_id": False,
-        # Discrepancy & Chaos (kept minimal client-side)
+        # Discrepancy & Chaos (client-side knobs kept minimal)
         "mismatch_value_pct": 0.0,
         "mismatch_currency": "NONE",   # NONE|PIXEL
         "desync_event_id": False,
@@ -176,26 +184,29 @@ def append_margin_pltv(custom_data, cfg_append, single_price=None, contents=None
     return cd
 
 # --------------------------- CAPI POST ---------------------------
-import requests
-
 def capi_post(server_events):
     with CONFIG_LOCK:
         cfg_capi = dict(CONFIG["capi"])
         capi_enabled = CONFIG["global"].get("enable_capi")
+
     if not capi_enabled:
         return {"skipped": True, "reason": "enable_capi=false"}
-    if not CAPI_URL or not ACCESS_TOKEN:
-        return {"skipped": True, "reason": "missing_capi_config"}
+    if not CAPI_URL:
+        return {"skipped": True, "reason": "missing_capi_config (PIXEL_ID or ACCESS_TOKEN missing)"}
 
+    # simulated network chaos
     lat = int(cfg_capi.get("net_capi_latency_ms", 0))
     if lat > 0: time.sleep(lat/1000.0)
     if _rng.random() < float(cfg_capi.get("net_capi_error_rate", 0.0)):
-        class Dummy: status_code=503; text="Simulated upstream error"
+        class Dummy:
+            status_code = 503
+            text = "Simulated upstream error"
         raise requests.HTTPError("503 Simulated", response=Dummy())
 
     payload = {"data": server_events}
     if TEST_EVENT_CODE:
         payload["test_event_code"] = TEST_EVENT_CODE
+
     r = requests.post(
         CAPI_URL,
         params={"access_token": ACCESS_TOKEN},
@@ -302,7 +313,7 @@ def _auto_loop():
             cfg_capi = dict(CONFIG["capi"])
             capi_enabled = CONFIG["global"].get("enable_capi")
         if capi_enabled:
-            # choose a random product and funnel
+            # choose a random product and send a purchase for simplicity
             sku = random.choice(list(CATALOG.keys()))
             price = product_price(sku)
             qty = _pick([1,1,1,2])
@@ -339,7 +350,7 @@ def _auto_loop():
                 })
             except Exception:
                 pass
-        # FIX: balanced parentheses here
+        # rate control (fixed syntax)
         delay = max(0.05, 1.0 / max(0.1, float(cfg_capi.get("rps", 0.5))))
         _stop_evt.wait(delay)
 
@@ -760,6 +771,7 @@ window.addEventListener('load', async () => { await loadAll(); });
       <span class="badge" id="b_capi">CAPI: ?</span>
       <span class="badge" id="b_seed">Seed: none</span>
       <a class="badge" href="/catalog">Catalog</a>
+      <a class="badge" href="/diag" title="Diagnostics JSON">Diagnostics</a>
     </div>
 
     <!-- Three main columns -->
@@ -882,7 +894,7 @@ window.addEventListener('load', async () => { await loadAll(); });
 def home():
     html = PAGE_HTML.replace("__APP_VERSION__", APP_VERSION)\
                     .replace("__PIXEL_ID__", PIXEL_ID or "")\
-                    .replace("__CAPI_ON__", "on" if (CAPI_URL and ACCESS_TOKEN) else "off")\
+                    .replace("__CAPI_ON__", "on" if CAPI_URL else "off")\
                     .replace("__TEST_ON__", "on" if TEST_EVENT_CODE else "off")
     return Response(html, mimetype="text/html")
 
@@ -1006,6 +1018,18 @@ def metrics_pixel():
         "event_source_url": body.get("event_source_url") or BASE_URL
     })
     return {"ok": True}
+
+# --------------------------- DIAGNOSTICS ---------------------------
+@app.get("/diag")
+def diag():
+    return jsonify({
+        "has_pixel_id": bool(PIXEL_ID),
+        "has_access_token": bool(ACCESS_TOKEN),
+        "capi_url_ready": bool(CAPI_URL),
+        "graph_ver": GRAPH_VER,
+        "test_event_code_present": bool(TEST_EVENT_CODE),
+        "base_url": BASE_URL
+    })
 
 # --------------------------- MAIN ---------------------------
 if __name__ == "__main__":
