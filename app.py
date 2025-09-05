@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # E-commerce Simulator (Light Mode)
-# - Three columns: Manual Sender (Pixel / CAPI / Both), Pixel Auto (browser), CAPI Auto (server)
-# - Per-column Advanced & Discrepancy controls (independent)
+# - Three columns: Manual Sender (Pixel/CAPI/Both), Pixel Auto (browser), CAPI Auto (server)
+# - Per-column Advanced & Discrepancy controls (independent where it matters)
 # - Product catalog with unique URLs (/catalog, /product/<sku>)
 # - Appended Events section for margin & PLTV (manual + auto), delay window, match-rate degradation
 import os, json, time, uuid, random, hashlib, threading
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Any, Dict, List
 from flask import Flask, request, Response, jsonify, redirect, url_for
 
@@ -16,22 +16,23 @@ TEST_EVENT_CODE = os.getenv("TEST_EVENT_CODE", "")
 GRAPH_VER       = os.getenv("GRAPH_VER", "v20.0")
 BASE_URL        = os.getenv("BASE_URL", "http://127.0.0.1:5000")
 CAPI_URL        = f"https://graph.facebook.com/{GRAPH_VER}/{PIXEL_ID}/events" if PIXEL_ID else None
-APP_VERSION     = "3.0.0"
+APP_VERSION     = "3.0.1"
 
 app = Flask(__name__)
 
 _ALLOWED_CURRENCIES = {"AUTO","NULL","USD","EUR","GBP","AUD","CAD","JPY"}
 
 def now_iso(): return datetime.now(tz=timezone.utc).isoformat()
+
 def iso_to_unix(ts_iso):
     dt = datetime.fromisoformat(ts_iso.replace("Z","+00:00"))
     return int(dt.replace(tzinfo=timezone.utc).timestamp())
+
 def sha256_norm(s):
     norm = (s or "").strip().lower()
     return hashlib.sha256(norm.encode("utf-8")).hexdigest()
 
 # --------------------------- CATALOG ---------------------------
-# You can expand/replace this with a real csv/db; keep ids stable for consistent dedup testing.
 CATALOG: Dict[str, Dict[str, Any]] = {
     "SKU-10001": {"name":"Classic Tee", "category":"Tops", "price":19.99},
     "SKU-10002": {"name":"Performance Tee", "category":"Tops", "price":28.00},
@@ -50,15 +51,18 @@ def product_price(sku, default=29.00):
 
 # --------------------------- STATE / CONFIG ---------------------------
 def _rng_id(): return str(uuid.uuid4())
+
 def to_bool(v, default=False):
     if isinstance(v, bool): return v
     if isinstance(v, (int,float)): return v != 0
     if isinstance(v, str): return v.strip().lower() in ("1","true","t","yes","y","on")
     return default
+
 def clampf(v, lo, hi, default):
     try: x = float(v)
     except Exception: return default
     return max(lo, min(hi, x))
+
 def clampp(v, lo, hi, default):
     try: x = int(v)
     except Exception: return default
@@ -66,8 +70,7 @@ def clampp(v, lo, hi, default):
 
 CONFIG_LOCK = threading.Lock()
 
-# Per-column profiles: pixel (browser), capi (server)
-# Each profile has independent advanced & discrepancy controls
+# Per-column profiles
 CONFIG: Dict[str, Any] = {
     "global": {
         "seed": "",
@@ -80,9 +83,9 @@ CONFIG: Dict[str, Any] = {
         "null_price": False,
         "null_currency": False,
         "null_event_id": False,
-        # Discrepancy & Chaos
+        # Discrepancy & Chaos (kept minimal client-side)
         "mismatch_value_pct": 0.0,
-        "mismatch_currency": "NONE",   # NONE|PIXEL (applies here) | CAPI (ignored here)
+        "mismatch_currency": "NONE",   # NONE|PIXEL
         "desync_event_id": False,
         "duplicate_event_id_n": 0,
         "drop_pixel_every_n": 0,
@@ -99,7 +102,7 @@ CONFIG: Dict[str, Any] = {
         "null_event_id": False,
         # Discrepancy & Chaos
         "mismatch_value_pct": 0.0,
-        "mismatch_currency": "NONE",  # NONE|CAPI (applies here) | PIXEL (ignored here)
+        "mismatch_currency": "NONE",  # NONE|CAPI
         "clock_skew_seconds": 0,
         "net_capi_latency_ms": 0,
         "net_capi_error_rate": 0.0,
@@ -123,15 +126,17 @@ CONFIG: Dict[str, Any] = {
 }
 
 _rng = random.Random()
+
 def reseed():
     with CONFIG_LOCK:
         s = (CONFIG["global"].get("seed") or "").strip()
     if s: _rng.seed(s)
     else: _rng.seed()
+
 reseed()
 
 # Simple event memory for appended events
-LAST_PIXEL_BASE: Dict[str, Any] = {}  # {"event_id":..., "event_time": int, "user_id":..., "sku":..., "value":...}
+LAST_PIXEL_BASE: Dict[str, Any] = {}
 LAST_CAPI_BASE:  Dict[str, Any] = {}
 
 # --------------------------- ECONOMICS HELPERS ---------------------------
@@ -176,7 +181,8 @@ import requests
 def capi_post(server_events):
     with CONFIG_LOCK:
         cfg_capi = dict(CONFIG["capi"])
-    if not CONFIG["global"].get("enable_capi"):
+        capi_enabled = CONFIG["global"].get("enable_capi")
+    if not capi_enabled:
         return {"skipped": True, "reason": "enable_capi=false"}
     if not CAPI_URL or not ACCESS_TOKEN:
         return {"skipped": True, "reason": "missing_capi_config"}
@@ -294,7 +300,8 @@ def _auto_loop():
     while not _stop_evt.is_set():
         with CONFIG_LOCK:
             cfg_capi = dict(CONFIG["capi"])
-        if CONFIG["global"].get("enable_capi"):
+            capi_enabled = CONFIG["global"].get("enable_capi")
+        if capi_enabled:
             # choose a random product and funnel
             sku = random.choice(list(CATALOG.keys()))
             price = product_price(sku)
@@ -320,20 +327,20 @@ def _auto_loop():
                 evs = map_manual_to_capi(base)
                 capi_post(evs)
                 # remember last capi event for appends
-                with app.app_context():
-                    LAST_CAPI_BASE.update({
-                        "event_id": base["event_id"],
-                        "event_time": ts_unix,
-                        "user_id": base["user_id"],
-                        "sku": sku,
-                        "value": value,
-                        "contents": contents,
-                        "currency": base["currency"],
-                        "event_source_url": base["event_source_url"],
-                    })
+                LAST_CAPI_BASE.update({
+                    "event_id": base["event_id"],
+                    "event_time": ts_unix,
+                    "user_id": base["user_id"],
+                    "sku": sku,
+                    "value": value,
+                    "contents": contents,
+                    "currency": base["currency"],
+                    "event_source_url": base["event_source_url"],
+                })
             except Exception:
                 pass
-        delay = max(0.05, 1.0 / max(0.1, float(cfg_capi.get("rps", 0.5)))))
+        # FIX: balanced parentheses here
+        delay = max(0.05, 1.0 / max(0.1, float(cfg_capi.get("rps", 0.5))))
         _stop_evt.wait(delay)
 
 @app.get("/auto/start")
@@ -398,7 +405,7 @@ def _make_appended_event(base_event: Dict[str,Any], delay_seconds: float) -> Dic
         ext_id_plain = ext_id_plain + "_x"  # simple scramble for demo
 
     ev = {
-        "event_name": "Purchase",  # appended to purchases; adjust as needed
+        "event_name": "Purchase",
         "event_time": int(base_event["event_time"] + max(0.0, delay_seconds)),
         "event_id": event_id,
         "action_source": "website",
@@ -436,7 +443,7 @@ def append_last():
     except Exception as e:
         return {"ok": False, "error": str(e)}, 500
 
-# Background auto-append to the last seen CAPI base event at random intervals in the window
+# Background auto-append
 _append_thread = None
 _append_stop = threading.Event()
 
@@ -478,12 +485,10 @@ h3{margin:0 0 8px;font-size:16px}
 .small{font-size:12px;color:var(--muted)}
 .kv{display:flex;gap:8px;align-items:center;margin:4px 0}
 .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
-input,select,button{border:1px solid var(--bd);border-radius:10px;padding:8px 10px;background:#fff;color:var(--fg)}
-button.btn{cursor:pointer;position:relative}
-.btn .tick,.btn .x{position:absolute;right:8px;top:50%;transform:translateY(-50%) scale(.8);opacity:0;transition:.18s}
-.btn .tick{color:var(--ok)}.btn .x{color:var(--err)}
-.btn.show-tick .tick{opacity:1;transform:translateY(-50%) scale(1)}
-.btn.show-err .x{opacity:1;transform:translateY(-50%) scale(1)}
+input,select,button{border:1px solid var(--bd);border-radius:10px;padding:8px 10px;background:#fff;color:var(--fg);transition:border-color .18s, background .18s, box-shadow .18s}
+button.btn{cursor:pointer}
+.btn.success-flash{border-color:var(--ok) !important; background:#ecfdf5 !important; box-shadow:0 0 0 3px rgba(16,185,129,.15)}
+.btn.error-hold{border-color:var(--err) !important; background:#fef2f2 !important; box-shadow:0 0 0 3px rgba(239,68,68,.15)}
 pre{background:#fff;border:1px solid var(--bd);padding:8px;border-radius:10px;max-height:140px;overflow:auto}
 .badge{display:inline-block;border:1px solid var(--bd);padding:2px 8px;border-radius:999px;font-size:11px;color:var(--muted)}
 hr{border:none;border-top:1px solid var(--bd);margin:8px 0}
@@ -501,10 +506,9 @@ a:hover{text-decoration:underline}
   fbq('init', '__PIXEL_ID__');
 })();
 function rid(){ return 'evt_' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
-function flashIcon(btn, ok){ if(!btn) return; const c=ok?'show-tick':'show-err'; btn.classList.add(c); setTimeout(()=>btn.classList.remove(c), 1000); }
 async function jget(u){ const r = await fetch(u); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); }
 async function jok(u,m){ try{ const r=await fetch(u,m); return r.ok; }catch(e){ return false; } }
-function copyTxt(t){ navigator.clipboard.writeText(t).catch(()=>{}); }
+function flashBorder(btn, ok){ if(!btn) return; btn.classList.remove('success-flash','error-hold'); if(ok){ btn.classList.add('success-flash'); setTimeout(()=>btn.classList.remove('success-flash'), 1000); } else { btn.classList.add('error-hold'); setTimeout(()=>btn.classList.remove('error-hold'), 2500); } }
 
 // ---------- Global badges ----------
 async function loadBadges(){
@@ -531,8 +535,9 @@ async function manualSend(btn){
   const price = parseFloat(document.getElementById('manual_price').value||String(document.getElementById('manual_price').placeholder));
   const value = Math.round(price * (evt==='ViewContent'?1:(evt==='AddToCart'?qty:qty)) * 100)/100;
   const contents = (evt==='ViewContent')?[]:[{id:sku, quantity:qty, item_price: price}];
-  const content_ids = (evt==='ViewContent')?[sku]:[];
   const eventURL = window.location.origin + '/product/' + encodeURIComponent(sku);
+
+  let okAll = true;
 
   // PIXEL arm
   if (channel==='pixel' || channel==='both'){
@@ -545,23 +550,26 @@ async function manualSend(btn){
     } else {
       payload.contents=contents; payload.currency=currentCurrencyPixel(); payload.value= cfgNullP? null : value;
     }
-    // send
-    try { fbq('track', evt, payload, {eventID: nullEvent? null : eidBase}); } catch(e){}
-    // ping server so appended events can use it
-    await fetch('/metrics/pixel', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({
-      event_name: evt, event_id: eidBase, user_id: 'u_manual', value: value, contents: contents, currency: payload.currency, event_source_url: eventURL
-    })}).catch(()=>{});
+    try {
+      fbq('track', evt, payload, {eventID: nullEvent? null : eidBase});
+      // store last pixel base on server
+      await fetch('/metrics/pixel', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({
+        event_name: evt, event_id: eidBase, user_id: 'u_manual', value: value, contents: contents, currency: payload.currency, event_source_url: eventURL
+      })});
+    } catch(e){ okAll = false; }
   }
 
   // CAPI arm
   if (channel==='capi' || channel==='both'){
-    const r = await jget('/send/manual?' + new URLSearchParams({
-      event_name: evt, sku: sku, qty: String(qty), price: String(price), eid: eidBase
-    }));
-    if (!r.ok) { flashIcon(btn,false); return; }
+    try{
+      const r = await jget('/send/manual?' + new URLSearchParams({
+        event_name: evt, sku: sku, qty: String(qty), price: String(price), eid: eidBase
+      }));
+      if (!r.ok) okAll=false;
+    }catch(e){ okAll=false; }
   }
 
-  flashIcon(btn, true);
+  flashBorder(btn, okAll);
 }
 
 // ---------- Pixel Auto ----------
@@ -594,26 +602,28 @@ function pxStart(btn){
   document.getElementById('px_status').textContent = 'Running @ '+(Math.round((1000/interval)*100)/100)+' ev/s';
   document.getElementById('pxStartBtn').disabled = true;
   document.getElementById('pxStopBtn').disabled = false;
-  flashIcon(btn, true);
+  flashBorder(btn, true);
 }
 function pxStop(btn){
   if (__pxTimer) clearInterval(__pxTimer); __pxTimer=null;
   document.getElementById('px_status').textContent = 'Stopped';
   document.getElementById('pxStartBtn').disabled = false;
   document.getElementById('pxStopBtn').disabled = true;
-  flashIcon(btn,true);
+  flashBorder(btn,true);
 }
 
 // ---------- Appended Events ----------
 async function appendLast(btn, source){
   const delay = parseFloat(document.getElementById('append_delay').value||'10');
-  const r = await jget('/append/last?'+new URLSearchParams({source, delay_s:String(delay)}));
-  flashIcon(btn, !!r.ok);
+  try{
+    const r = await jget('/append/last?'+new URLSearchParams({source, delay_s:String(delay)}));
+    flashBorder(btn, !!r.ok);
+  }catch(e){ flashBorder(btn,false); }
 }
 async function appendToggle(btn){
   const on = document.getElementById('append_auto').checked;
   const ok = await jok('/config/append', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({enable_auto_append: on})});
-  flashIcon(btn, ok);
+  flashBorder(btn, ok);
 }
 
 // ---------- Save per-column controls ----------
@@ -633,7 +643,7 @@ async function savePixel(btn){
     }
   };
   const ok = await jok('/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  flashIcon(btn, ok); loadBadges();
+  flashBorder(btn, ok); loadBadges();
 }
 async function saveCapi(btn){
   const body = {
@@ -654,7 +664,7 @@ async function saveCapi(btn){
     }
   };
   const ok = await jok('/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  flashIcon(btn, ok); loadBadges();
+  flashBorder(btn, ok); loadBadges();
 }
 async function saveAppend(btn){
   const body = {
@@ -673,7 +683,7 @@ async function saveAppend(btn){
     }
   };
   const ok = await jok('/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  flashIcon(btn, ok);
+  flashBorder(btn, ok);
 }
 
 // ---------- Load controls ----------
@@ -768,9 +778,7 @@ window.addEventListener('load', async () => { await loadAll(); });
         </div>
         <div class="kv"><label>Qty</label><input id="manual_qty" type="number" min="1" step="1" value="1"/></div>
         <div class="kv"><label>Price ($)</label><input id="manual_price" type="number" step="0.01" min="0" placeholder="29.00"/></div>
-        <div class="row"><button class="btn" onclick="manualSend(this)">Send
-          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
-          <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span></button></div>
+        <div class="row"><button class="btn" onclick="manualSend(this)">Send</button></div>
         <hr/>
         <h3>Advanced (Manual – Pixel)</h3>
         <div class="kv"><label>Currency</label>
@@ -786,7 +794,7 @@ window.addEventListener('load', async () => { await loadAll(); });
         <div class="kv"><label>Duplicate every N</label><input id="pixel_duplicate_event_id_n" type="number" step="1" min="0" value="0"/></div>
         <div class="kv"><label>Drop every N</label><input id="pixel_drop_every_n" type="number" step="1" min="0" value="0"/></div>
         <div class="kv"><label>Clock skew (s)</label><input id="pixel_clock_skew" type="number" step="1" value="0"/></div>
-        <div class="row"><button class="btn" onclick="savePixel(this)">Save Pixel Controls<span class="tick"></span><span class="x"></span></button></div>
+        <div class="row"><button class="btn" onclick="savePixel(this)">Save Pixel Controls</button></div>
       </div>
 
       <!-- Column 2: Pixel Auto -->
@@ -794,12 +802,12 @@ window.addEventListener('load', async () => { await loadAll(); });
         <h3>Pixel Auto (browser → Pixel)</h3>
         <div class="kv"><label>Events/sec</label><input id="px_rps" type="number" step="0.1" min="0.1" value="0.5"/></div>
         <div class="row">
-          <button id="pxStartBtn" class="btn" onclick="pxStart(this)">Start<span class="tick"></span><span class="x"></span></button>
-          <button id="pxStopBtn" class="btn" onclick="pxStop(this)" disabled>Stop<span class="tick"></span><span class="x"></span></button>
+          <button id="pxStartBtn" class="btn" onclick="pxStart(this)">Start</button>
+          <button id="pxStopBtn" class="btn" onclick="pxStop(this)" disabled>Stop</button>
         </div>
         <p id="px_status" class="small">Stopped</p>
         <hr/>
-        <p class="small">Uses the Pixel controls in the Manual column (same profile) so you can keep them in one place for browser events.</p>
+        <p class="small">Uses the Pixel controls in the Manual column for browser events.</p>
       </div>
 
       <!-- Column 3: CAPI Auto -->
@@ -807,8 +815,8 @@ window.addEventListener('load', async () => { await loadAll(); });
         <h3>Auto Stream (server → CAPI)</h3>
         <div class="kv"><label>Sessions/sec</label><input id="rps" type="number" step="0.1" min="0.1" value="0.5"/></div>
         <div class="row">
-          <button id="startBtn" class="btn" onclick="(async(b)=>{const ok=await jok('/auto/start?'+new URLSearchParams({rps:document.getElementById('rps').value||'0.5'})); flashIcon(b,ok) })(this)">Start<span class="tick"></span><span class="x"></span></button>
-          <button id="stopBtn" class="btn" onclick="(async(b)=>{const ok=await jok('/auto/stop'); flashIcon(b,ok)})(this)">Stop<span class="tick"></span><span class="x"></span></button>
+          <button id="startBtn" class="btn" onclick="(async(b)=>{const ok=await jok('/auto/start?'+new URLSearchParams({rps:document.getElementById('rps').value||'0.5'})); flashBorder(b,ok) })(this)">Start</button>
+          <button id="stopBtn" class="btn" onclick="(async(b)=>{const ok=await jok('/auto/stop'); flashBorder(b,ok)})(this)">Stop</button>
         </div>
         <p id="status" class="small">…</p>
         <hr/>
@@ -828,7 +836,7 @@ window.addEventListener('load', async () => { await loadAll(); });
         <div class="kv"><label>Clock skew (s)</label><input id="capi_clock_skew" type="number" step="1" value="0"/></div>
         <div class="kv"><label>Latency (ms)</label><input id="capi_latency" type="number" step="1" min="0" value="0"/></div>
         <div class="kv"><label>Error rate</label><input id="capi_error_rate" type="number" step="0.01" min="0" max="1" value="0"/></div>
-        <div class="row"><button class="btn" onclick="saveCapi(this)">Save CAPI Controls<span class="tick"></span><span class="x"></span></button></div>
+        <div class="row"><button class="btn" onclick="saveCapi(this)">Save CAPI Controls</button></div>
       </div>
     </div>
 
@@ -838,7 +846,7 @@ window.addEventListener('load', async () => { await loadAll(); });
       <p class="small">Send margin & PLTV as appended signals after the original event. You can degrade match and adjust delay window.</p>
       <div class="row">
         <label><input id="append_auto" type="checkbox"/> Auto-append (periodic)</label>
-        <button class="btn" onclick="appendToggle(this)">Apply<span class="tick"></span><span class="x"></span></button>
+        <button class="btn" onclick="appendToggle(this)">Apply</button>
       </div>
       <div class="row">
         <div class="kv"><label>Margin</label><input id="append_margin" type="checkbox" checked/></div>
@@ -858,9 +866,9 @@ window.addEventListener('load', async () => { await loadAll(); });
         <div class="kv"><label>Scramble external_id %</label><input id="scramble_external_id_pct" type="number" step="0.01" min="0" max="1" value="0"/></div>
       </div>
       <div class="row">
-        <button class="btn" onclick="appendLast(this,'capi')">Append to last CAPI<span class="tick"></span><span class="x"></span></button>
-        <button class="btn" onclick="appendLast(this,'pixel')">Append to last Pixel<span class="tick"></span><span class="x"></span></button>
-        <button class="btn" onclick="saveAppend(this)">Save Append Controls<span class="tick"></span><span class="x"></span></button>
+        <button class="btn" onclick="appendLast(this,'capi')">Append to last CAPI</button>
+        <button class="btn" onclick="appendLast(this,'pixel')">Append to last Pixel</button>
+        <button class="btn" onclick="saveAppend(this)">Save Append Controls</button>
       </div>
     </div>
   </div>
@@ -880,7 +888,6 @@ def home():
 
 @app.get("/catalog")
 def catalog():
-    # super simple catalog index
     rows = "".join([f'<li><a href="/product/{sku}">{sku} — {p["name"]} (${p["price"]})</a></li>' for sku,p in CATALOG.items()])
     page = f"""<!doctype html><meta charset="utf-8"><title>Catalog</title>
     <div style="font-family:system-ui;padding:16px">
@@ -895,7 +902,6 @@ def product_page(sku):
     p = CATALOG.get(sku)
     if not p:
         return redirect(url_for('catalog'))
-    # very minimal product page; Pixel fires client-side when you click Manual/Auto in main UI
     html = f"""<!doctype html><meta charset="utf-8"><title>{p["name"]}</title>
     <div style="font-family:system-ui;padding:16px">
       <h2>{p["name"]}</h2>
@@ -910,7 +916,6 @@ def get_config():
     with CONFIG_LOCK:
         out = json.loads(json.dumps(CONFIG))
         out["catalog"] = CATALOG
-    # ensure append thread if requested
     if out["append"].get("enable_auto_append"): _ensure_append_thread()
     return jsonify(out)
 
@@ -941,7 +946,7 @@ def set_append_only():
 # --------------------------- ROUTES: SERVER SENDS ---------------------------
 @app.get("/send/manual")
 def send_manual_capi():
-    # Minimal manual → CAPI bridge for the Manual Sender "CAPI" / "Both"
+    # Manual → CAPI bridge for Manual Sender "CAPI" / "Both"
     evt = request.args.get("event_name","ViewContent")
     sku = request.args.get("sku","SKU-10001")
     qty = clampp(request.args.get("qty","1"), 1, 999999, 1)
@@ -969,7 +974,6 @@ def send_manual_capi():
     try:
         evs = map_manual_to_capi(base)
         resp = capi_post(evs)
-        # remember last capi base
         LAST_CAPI_BASE.update({
             "event_id": eid,
             "event_time": base["event_time_unix"],
@@ -984,7 +988,7 @@ def send_manual_capi():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# Pixel metrics intake so server can remember last pixel base for appended events
+# Pixel metrics intake: remember last pixel base for appended events
 @app.post("/metrics/pixel")
 def metrics_pixel():
     try:
@@ -995,7 +999,7 @@ def metrics_pixel():
         "event_id": body.get("event_id"),
         "event_time": int(time.time()),
         "user_id": body.get("user_id","u_unknown"),
-        "sku": (body.get("contents") or [{}])[0].get("id") if body.get("contents") else (body.get("content_ids") or [None])[0],
+        "sku": (body.get("contents") or [{}])[0].get("id") if body.get("contents") else None,
         "value": body.get("value"),
         "contents": body.get("contents"),
         "currency": body.get("currency"),
@@ -1003,17 +1007,8 @@ def metrics_pixel():
     })
     return {"ok": True}
 
-# --------------------------- AUTO STATUS ---------------------------
-@app.get("/auto/status")
-def auto_status_simple():
-    running = _auto_thread is not None and _auto_thread.is_alive()
-    with CONFIG_LOCK:
-        rps = round(CONFIG["capi"]["rps"], 2)
-    return jsonify({"ok": True, "running": running, "rps": rps})
-
 # --------------------------- MAIN ---------------------------
 if __name__ == "__main__":
-    # kick off append thread if enabled
     if CONFIG["append"].get("enable_auto_append"):
         _ensure_append_thread()
     port = int(os.getenv("PORT","5000"))
