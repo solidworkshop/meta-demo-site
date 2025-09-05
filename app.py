@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-E-commerce Simulator — Full Polished v4
-- Includes all features from v3 (Meta Pixel & CAPI, counters, glow, error viewer, polished buttons)
-- Adds green banner if no .env file is present (assume Render env vars)
+E-commerce Simulator — Full Fixed v4
+- Based on polished v3 (all features intact)
+- Adds green info banner if no .env file is present (assume Render env vars)
 """
 import os, json, time, uuid, random, hashlib, threading
 from datetime import datetime, timezone
@@ -53,8 +53,6 @@ def ensure_catalog(size: int) -> None:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
-
-# ... same routes as polished v3 (not fully repeated here for brevity) ...
 
 @app.get("/")
 def index():
