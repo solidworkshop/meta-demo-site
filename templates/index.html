@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>E‑commerce Simulator (Light)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>E‑commerce Simulator</h1>
+    <nav>
+      <a href="/?lite=1">Lite</a>
+      <a href="/?lite=0">Full</a>
+      <a href="/catalog">Catalog</a>
+    </nav>
+  </header>
+
+  <section class="flags">
+    <div>PIXEL_ID set: <strong class="{{ 'good' if pixel_id_set else 'bad' }}">{{ 'yes' if pixel_id_set else 'no' }}</strong></div>
+    <div>CAPI URL set: <strong class="{{ 'good' if capi_url_set else 'bad' }}">{{ 'yes' if capi_url_set else 'no' }}</strong></div>
+    <div>TEST_EVENT_CODE set: <strong class="{{ 'good' if test_event_code_set else 'bad' }}">{{ 'yes' if test_event_code_set else 'no' }}</strong></div>
+    <div>Mode: <code>{{ 'LITE' if lite else 'FULL' }}</code></div>
+  </section>
+
+  <main class="grid3">
+    <!-- Manual Sender -->
+    <section class="card">
+      <h2>Manual Sender</h2>
+      <div class="controls" data-scope="manual">
+        <label>Event
+          <select class="js-event">
+            <option>Purchase</option>
+            <option>ViewContent</option>
+            <option>AddToCart</option>
+          </select>
+        </label>
+        <label>SKU
+          <input class="js-sku" placeholder="SKU0001">
+        </label>
+        <label>Price
+          <input class="js-price" type="number" step="0.01" placeholder="19.99">
+        </label>
+        <label>Currency
+          <select class="js-currency">
+            <option value="AUTO">Auto</option>
+            <option value="USD">USD</option>
+            <option value="EUR">EUR</option>
+            <option value="JPY">JPY</option>
+            <option value="NULL">Null</option>
+          </select>
+        </label>
+        <label>PLTV
+          <input class="js-pltv" type="number" step="0.01" placeholder="120.00">
+        </label>
+        <div class="row small">
+          <label><input class="js-null-price" type="checkbox"> Null price</label>
+          <label><input class="js-null-currency" type="checkbox"> Null currency</label>
+          <label><input class="js-null-eid" type="checkbox"> Null event_id</label>
+        </div>
+        <div class="row">
+          <label>Delay (ms) <input class="js-delay" type="number" min="0" max="5000" value="0"></label>
+        </div>
+        <div class="row">
+          <label>Margin cost% min <input class="js-cost-min" type="number" min="0" max="99" value="20"></label>
+          <label>max <input class="js-cost-max" type="number" min="1" max="99" value="70"></label>
+        </div>
+
+        <div class="row">
+          <button class="btn js-send" data-channel="pixel">Send Pixel</button>
+          <button class="btn js-send" data-channel="capi">Send CAPI</button>
+          <button class="btn js-send" data-channel="both">Send Both</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- Pixel Auto -->
+    <section class="card">
+      <h2>Pixel Auto</h2>
+      {% if enable_pixel_auto %}
+      <div class="auto on">Auto is ON (env)</div>
+      {% else %}
+      <div class="auto off">Auto is OFF (env)</div>
+      {% endif %}
+      <div class="controls" data-scope="pixel">
+        <label>Interval (ms)
+          <input class="js-interval" type="number" value="{{ 1500 if not lite else 0 }}" {{ 'disabled' if lite else '' }}>
+        </label>
+        <label>Currency
+          <select class="js-currency">
+            <option value="AUTO">Auto</option>
+            <option value="USD">USD</option>
+            <option value="EUR">EUR</option>
+            <option value="JPY">JPY</option>
+            <option value="NULL">Null</option>
+          </select>
+        </label>
+        <div class="row small">
+          <label><input class="js-null-price" type="checkbox"> Null price</label>
+          <label><input class="js-null-currency" type="checkbox"> Null currency</label>
+          <label><input class="js-null-eid" type="checkbox"> Null event_id</label>
+        </div>
+        <div class="row">
+          <label>Delay (ms) <input class="js-delay" type="number" min="0" max="5000" value="{{ 0 if lite else 300 }}"></label>
+        </div>
+        <div class="row">
+          <label>Margin cost% min <input class="js-cost-min" type="number" min="0" max="99" value="25"></label>
+          <label>max <input class="js-cost-max" type="number" min="1" max="99" value="60"></label>
+        </div>
+        <div class="row">
+          <button class="btn js-toggle-auto" data-channel="pixel">Start Auto</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- CAPI Auto -->
+    <section class="card">
+      <h2>CAPI Auto</h2>
+      {% if enable_capi_auto %}
+      <div class="auto on">Auto is ON (env)</div>
+      {% else %}
+      <div class="auto off">Auto is OFF (env)</div>
+      {% endif %}
+      <div class="controls" data-scope="capi">
+        <label>Interval (ms)
+          <input class="js-interval" type="number" value="{{ 1800 if not lite else 0 }}" {{ 'disabled' if lite else '' }}>
+        </label>
+        <label>Currency
+          <select class="js-currency">
+            <option value="AUTO">Auto</option>
+            <option value="USD">USD</option>
+            <option value="EUR">EUR</option>
+            <option value="JPY">JPY</option>
+            <option value="NULL">Null</option>
+          </select>
+        </label>
+        <div class="row small">
+          <label><input class="js-null-price" type="checkbox"> Null price</label>
+          <label><input class="js-null-currency" type="checkbox"> Null currency</label>
+          <label><input class="js-null-eid" type="checkbox"> Null event_id</label>
+        </div>
+        <div class="row">
+          <label>Delay (ms) <input class="js-delay" type="number" min="0" max="5000" value="{{ 0 if lite else 300 }}"></label>
+        </div>
+        <div class="row">
+          <label>Margin cost% min <input class="js-cost-min" type="number" min="0" max="99" value="30"></label>
+          <label>max <input class="js-cost-max" type="number" min="1" max="99" value="55"></label>
+        </div>
+        <div class="row">
+          <button class="btn js-toggle-auto" data-channel="capi">Start Auto</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="foot">
+    <small>Base URL: {{ base_url }} · Tip: add <code>?lite=1</code> for fastest loads.</small>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

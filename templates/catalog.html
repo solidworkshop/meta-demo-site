@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Catalog</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>Catalog</h1>
+    <nav>
+      <a href="/">Home</a>
+    </nav>
+  </header>
+  <main class="catalog">
+    {% for it in items %}
+      <a class="item" href="{{ it.url }}">
+        <strong>{{ it.name }}</strong>
+        <span>{{ it.sku }}</span>
+        <em>${{ '%.2f'|format(it.price) }}</em>
+      </a>
+    {% endfor %}
+  </main>
+</body>
+</html>
