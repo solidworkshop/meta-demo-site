@@ -1,19 +1,24 @@
 #!/usr/bin/env python3
 """
-E‑commerce Simulator (Light Mode) — Full Project
+E-commerce Simulator (Light Mode) — Full Project with .env support
 - Three columns: Manual Sender (Pixel/CAPI/Both), Pixel Auto (browser), CAPI Auto (server)
 - Per-column Advanced & Discrepancy controls (independent where it matters)
-- Product catalog with unique URLs (/catalog, /product/<sku>), simple in‑memory "DB"
+- Product catalog with unique URLs (/catalog, /product/<sku>), simple in-memory "DB"
 - Appended metrics: margin & PLTV (manual + auto), optional delay window, match-rate degradation
 - Bad data toggles: null price/currency/event_id
 - Master switches: enable/disable Pixel and CAPI
 - Button success/fail = border flash (green on success, red persists on error)
+- Loads environment from .env via python-dotenv
 """
 import os, json, time, uuid, random, hashlib, threading
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 import requests
 from flask import Flask, request, jsonify, render_template, redirect, url_for
+from dotenv import load_dotenv
+
+# --------------------------- Load .env ---------------------------
+load_dotenv()  # will read .env if present
 
 # --------------------------- ENV / CONST ---------------------------
 PIXEL_ID        = os.getenv("PIXEL_ID", "")
@@ -32,7 +37,7 @@ def capi_url() -> Optional[str]:
 # Flask
 app = Flask(__name__)
 
-# --------------------------- In‑Memory State ---------------------------
+# --------------------------- In-Memory State ---------------------------
 class CatalogItem(Dict[str, Any]):
     pass
 
@@ -61,7 +66,7 @@ CATALOG_LOCK = threading.Lock()
 
 # --------------------------- Helpers ---------------------------
 def ensure_catalog(size: int) -> None:
-    """Ensure the in‑memory catalog has exactly `size` items."""
+    """Ensure the in-memory catalog has exactly `size` items."""
     with CATALOG_LOCK:
         current = len(STATE["catalog"])
         if current == size:
@@ -128,7 +133,12 @@ def send_capi(payload: Dict[str, Any]) -> Dict[str, Any]:
             timeout=10,
         )
         ok = resp.status_code == 200
-        return {"ok": ok, "status": resp.status_code, "body": resp.json() if resp.content else {}}
+        body = {}
+        try:
+            body = resp.json() if resp.content else {}
+        except Exception:
+            body = {"raw_text": resp.text}
+        return {"ok": ok, "status": resp.status_code, "body": body}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -264,7 +274,6 @@ def api_manual_send():
 # ---- API: server auto (CAPI) ----
 def _server_auto_loop():
     while not STATE["server_auto"]["stop_flag"]:
-        # Compose controls from current server_auto settings
         controls = {
             "bad_nulls": STATE["server_auto"]["bad_nulls"],
             "cost_pct_min": STATE["server_auto"]["cost_pct_min"],

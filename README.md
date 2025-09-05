@@ -1,4 +1,4 @@
-# E‑commerce Simulator (Light Mode)
+# E-commerce Simulator (Light Mode) — with `.env` support
 
 A self-contained Flask app to simulate Meta Pixel & Conversions API (CAPI) traffic with rich controls.
 
@@ -17,13 +17,10 @@ A self-contained Flask app to simulate Meta Pixel & Conversions API (CAPI) traff
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-# Export your environment variables as needed
-export PIXEL_ID=YOUR_PIXEL_ID
-export ACCESS_TOKEN=YOUR_ACCESS_TOKEN
-export TEST_EVENT_CODE=OPTIONAL_TEST_CODE
-export GRAPH_VER=v21.0
-export BASE_URL=http://127.0.0.1:5000
-export DEFAULT_CATALOG_SIZE=24
+
+cp .env.example .env
+# edit .env and set PIXEL_ID, ACCESS_TOKEN, etc.
+
 python app.py
 ```
 
@@ -33,8 +30,13 @@ Open http://127.0.0.1:5000
 
 ## Deploying to Render
 - Set **Start Command**: `python app.py`
-- Add Environment:
-  - `PIXEL_ID`, `ACCESS_TOKEN`, `TEST_EVENT_CODE` (optional), `GRAPH_VER` (e.g., `v21.0`), `BASE_URL` (your Render URL), `DEFAULT_CATALOG_SIZE`.
+- Add Environment (or keep them in a private `.env` if your host supports it):
+  - `PIXEL_ID`
+  - `ACCESS_TOKEN`
+  - `TEST_EVENT_CODE` (optional)
+  - `GRAPH_VER` (e.g., `v21.0`)
+  - `BASE_URL` (your Render URL)
+  - `DEFAULT_CATALOG_SIZE`
 - Expose port **5000**.
 
 ## Endpoints
