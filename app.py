@@ -2,32 +2,33 @@
 import os, json, time, uuid, random, hashlib
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
-from flask import Flask, request, jsonify, render_template, redirect, url_for
+from flask import Flask, request, jsonify, render_template
+import requests
 
 app = Flask(__name__)
 
 # --------------------------- ENV / CONST ---------------------------
 PIXEL_ID        = os.getenv("PIXEL_ID", "")
 ACCESS_TOKEN    = os.getenv("ACCESS_TOKEN", "")
-TEST_EVENT_CODE = os.getenv("TEST_EVENT_CODE", "")
+TEST_EVENT_CODE = os.getenv("TEST_EVENT_CODE", "")  # set this to see events under "Test Events"
 GRAPH_VER       = os.getenv("GRAPH_VER", "v20.0")
 BASE_URL        = os.getenv("BASE_URL", "http://127.0.0.1:5000")
 CATALOG_SIZE    = int(os.getenv("CATALOG_SIZE", "20"))
 LITE_MODE_ENV   = os.getenv("LITE_MODE", "0") == "1"
+DRY_RUN_ENV     = os.getenv("DRY_RUN", "0") == "1"  # force dry-run even if creds exist
 
 # Safe CAPI URL construction
 CAPI_URL: Optional[str] = None
 if PIXEL_ID and GRAPH_VER:
     CAPI_URL = f"https://graph.facebook.com/{GRAPH_VER}/{PIXEL_ID}/events"
 
-# Feature flags (default off for speed; flip to "1" to enable)
+# Feature flags
 ENABLE_PIXEL_AUTO_DEFAULT = os.getenv("ENABLE_PIXEL_AUTO", "0") == "1"
 ENABLE_CAPI_AUTO_DEFAULT  = os.getenv("ENABLE_CAPI_AUTO", "0") == "1"
-ENABLE_CATALOG_UI_DEFAULT = os.getenv("ENABLE_CATALOG_UI", "1") == "1"  # catalog useful even in lite
+ENABLE_CATALOG_UI_DEFAULT = os.getenv("ENABLE_CATALOG_UI", "1") == "1"
 
 # --------------------------- Helpers ---------------------------
 def is_lite_mode() -> bool:
-    # Query param ?lite=1 overrides env for quick iteration
     q = request.args.get("lite")
     if q is not None:
         return q == "1"
@@ -40,12 +41,11 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 def pick_currency(p: str) -> str:
-    # 'AUTO' -> USD, else pass-through; 'NULL' -> None handled elsewhere
     if p == "AUTO":
         return "USD"
     return p
 
-# Basic toy catalog (deterministic-ish with seed)
+# Catalog
 random.seed(1234)
 CATALOG: List[Dict[str, Any]] = []
 for i in range(1, CATALOG_SIZE + 1):
@@ -56,7 +56,7 @@ for i in range(1, CATALOG_SIZE + 1):
         "name": f"Demo Product {i}",
         "price": price,
         "url": f"/product/{sku}",
-        "image": None,  # placeholder
+        "image": None,
     })
 
 def compute_margin(price: Optional[float], min_cost_pct: float, max_cost_pct: float) -> Optional[float]:
@@ -96,23 +96,6 @@ def product(sku: str):
 
 @app.route("/api/send", methods=["POST"])
 def api_send():
-    """
-    Accepts JSON:
-    {
-      "channel": "pixel" | "capi" | "both",
-      "event_name": "Purchase",
-      "price": 12.34 or null,
-      "currency": "USD" | "AUTO" | "NULL",
-      "allow_null_price": bool,
-      "allow_null_currency": bool,
-      "allow_null_event_id": bool,
-      "pltv": float or null,
-      "margin_cost_min_pct": 20.0,
-      "margin_cost_max_pct": 70.0,
-      "sku": "SKU0001" (optional),
-      "delay_ms": 0..2000 (optional)
-    }
-    """
     try:
         payload = request.get_json(force=True) or {}
         delay_ms = int(payload.get("delay_ms", 0))
@@ -128,12 +111,9 @@ def api_send():
             currency = None if currency_raw == "NULL" else currency
 
         event_id = str(uuid.uuid4())
-        if payload.get("allow_null_event_id", False):
-            # 50% chance to null when toggle is on
-            if random.random() < 0.5:
-                event_id = None
+        if payload.get("allow_null_event_id", False) and random.random() < 0.5:
+            event_id = None
 
-        # Compute margin
         margin = compute_margin(price, float(payload.get("margin_cost_min_pct", 20.0)),
                                       float(payload.get("margin_cost_max_pct", 70.0)))
         pltv = payload.get("pltv", None)
@@ -158,33 +138,47 @@ def api_send():
             "action_source": "website",
             "event_source_url": f"{BASE_URL}/product/{sku}" if sku else BASE_URL,
             "user_data": {
-                # Example hashed signals (fake)
                 "em": ["d41d8cd98f00b204e9800998ecf8427e"],
                 "client_user_agent": request.headers.get("User-Agent", ""),
                 "client_ip_address": request.remote_addr,
             }
         }
 
-        # "Send" Pixel = we just echo what would be sent client-side
+        # Simulated Pixel result
         pixel_result = None
         if payload["channel"] in ("pixel", "both"):
-            pixel_result = {"status": "dry-run", "desc": "Pixel call simulated in server for UI feedback", "data": common}
+            pixel_result = {"status": "dry-run", "desc": "Pixel call simulated for UI feedback", "data": common}
 
-        # Send CAPI (real call only if creds available), otherwise dry-run
+        # Conversions API real POST if possible
         capi_result = None
-        if payload["channel"] in ("capi", "both"):
-            if CAPI_URL and ACCESS_TOKEN:
-                # Real external request is omitted in this offline simulator to avoid network calls.
-                # Instead, emulate a "success" response.
-                capi_result = {"status": "ok", "desc": "CAPI emulated success (no external call made)", "data": common}
+        want_capi = payload["channel"] in ("capi", "both")
+        if want_capi:
+            if CAPI_URL and ACCESS_TOKEN and not DRY_RUN_ENV:
+                params = {"access_token": ACCESS_TOKEN}
+                if TEST_EVENT_CODE:
+                    params["test_event_code"] = TEST_EVENT_CODE
+                body = {"data": [common], "partner_agent": "ecomm-sim/1.0"}
+                try:
+                    r = requests.post(CAPI_URL, params=params, json=body, timeout=10)
+                    try:
+                        j = r.json()
+                    except Exception:
+                        j = {"text": r.text}
+                    capi_result = {
+                        "status": "ok" if r.status_code in (200, 201) else "http_error",
+                        "http_status": r.status_code,
+                        "response": j,
+                    }
+                except Exception as e:
+                    capi_result = {"status": "exception", "error": str(e)}
             else:
-                capi_result = {"status": "dry-run", "desc": "CAPI credentials missing; simulated only", "data": common}
+                capi_result = {"status": "dry-run", "desc": "Missing creds or DRY_RUN enabled; not posted", "data": common}
 
         return jsonify({
             "ok": True,
             "pixel": pixel_result,
             "capi": capi_result,
-            "debug": {"capi_url_set": bool(CAPI_URL), "pixel_id_set": bool(PIXEL_ID)}
+            "debug": {"capi_url_set": bool(CAPI_URL), "pixel_id_set": bool(PIXEL_ID), "dry_run": DRY_RUN_ENV}
         })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 400

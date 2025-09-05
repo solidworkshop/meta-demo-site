@@ -2,16 +2,11 @@
   function el(sel, root){ return (root||document).querySelector(sel); }
   function els(sel, root){ return Array.from((root||document).querySelectorAll(sel)); }
 
-  // Button border feedback: flash green on success, hold red on error
   function flashButton(btn, ok){
     btn.classList.remove('ok','err');
-    void btn.offsetWidth; // reflow
-    if(ok){
-      btn.classList.add('ok');
-      setTimeout(()=>btn.classList.remove('ok'), 400);
-    }else{
-      btn.classList.add('err'); // stays until next click
-    }
+    void btn.offsetWidth;
+    if(ok){ btn.classList.add('ok'); setTimeout(()=>btn.classList.remove('ok'), 400); }
+    else{ btn.classList.add('err'); }
   }
 
   async function sendOnce(scopeEl, channel){
@@ -42,8 +37,10 @@
         body: JSON.stringify(body)
       });
       const data = await res.json();
-      flashButton(btn, data.ok);
-      if(!data.ok){ console.error(data); }
+      flashButton(btn, data.ok && (!data.capi || data.capi.status !== 'http_error'));
+      if(!data.ok || (data.capi && data.capi.status !== 'ok' && data.capi.status !== 'dry-run')){
+        console.error('CAPI result:', data.capi);
+      }
       return data.ok;
     }catch(e){
       console.error(e);
@@ -52,7 +49,6 @@
     }
   }
 
-  // Manual sender buttons
   els('.controls[data-scope="manual"] .js-send').forEach(btn=>{
     btn.addEventListener('click', ()=>{
       const scope = btn.closest('.controls');
@@ -61,7 +57,6 @@
     });
   });
 
-  // Auto senders
   const timers = { pixel: null, capi: null };
   els('.js-toggle-auto').forEach(btn=>{
     btn.addEventListener('click', ()=>{
@@ -72,10 +67,7 @@
         btn.textContent = 'Start Auto';
       }else{
         const iv = parseInt(el('.js-interval', scope)?.value || '2000', 10);
-        if(!iv || iv < 200){ // guard
-          btn.textContent = 'Start Auto';
-          return;
-        }
+        if(!iv || iv < 200){ btn.textContent = 'Start Auto'; return; }
         btn.textContent = 'Stop Auto';
         timers[channel] = setInterval(()=> sendOnce(scope, channel), iv);
       }

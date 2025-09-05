@@ -1,34 +1,35 @@
-E‑commerce Simulator — Quick Start
-==================================
+E-commerce Simulator (REAL CAPI) — Quick Start
+================================================
 
-What you get
-------------
-- Light-mode Flask app with three columns:
-  - Manual Sender (Pixel / CAPI / Both)
-  - Pixel Auto (browser)
-  - CAPI Auto (server)
-- Per-column controls: delay, currency (Auto/Null/specific), null toggles, margin cost% min/max, PLTV
-- Product catalog with unique URLs: /catalog and /product/<sku>
-- Button success/failure via **border** (green flash on success, red holds on error)
-- Feature flags + Lite mode for fast page loads
+This build **posts to Meta Conversions API** when PIXEL_ID and ACCESS_TOKEN are set
+(and DRY_RUN is not 1). If TEST_EVENT_CODE is set, activity will appear under
+**Events Manager → Test Events**.
 
-Run
----
+Run locally
+-----------
 1) Python 3.9+
-2) `pip install flask`
-3) `python app.py`
-4) Open http://127.0.0.1:5000/?lite=1 for fastest iteration.
-
-Env Vars (optional)
--------------------
-- PIXEL_ID, ACCESS_TOKEN, TEST_EVENT_CODE
-- GRAPH_VER (default v20.0), BASE_URL (default http://127.0.0.1:5000)
-- CATALOG_SIZE (default 20)
-- LITE_MODE=1 (default off)
-- ENABLE_PIXEL_AUTO=1 / ENABLE_CAPI_AUTO=1 / ENABLE_CATALOG_UI=1
+2) `pip install flask requests`
+3) `export PIXEL_ID=your_pixel_id`
+4) `export ACCESS_TOKEN=your_system_user_token`
+5) (optional) `export TEST_EVENT_CODE=XXXXXXX`  # copy from Events Manager
+6) (optional) `export DRY_RUN=0`  # ensure real POSTs
+7) `python app.py`
+8) Open http://127.0.0.1:5000/?lite=1
 
 Notes
 -----
-- No external network calls are made; CAPI is emulated as "ok" if creds exist, otherwise "dry-run".
-- Use the Manual Sender buttons to test payloads instantly.
-- Add `?lite=1` during development to avoid heavy UI and timers.
+- Endpoint: https://graph.facebook.com/{GRAPH_VER}/{PIXEL_ID}/events
+- Params: access_token (+ test_event_code if provided)
+- JSON: {"data":[<event>], "partner_agent":"ecomm-sim/1.0"}
+- If you still see "No recent activity":
+  * Make sure you're looking under **Test Events** if you set TEST_EVENT_CODE.
+  * Confirm your token has `ads_management` + pixel permissions.
+  * Ensure your machine has internet access and port 443 outbound.
+  * Try a direct cURL:
+
+curl -X POST "https://graph.facebook.com/v20.0/YOUR_PIXEL_ID/events?access_token=YOUR_TOKEN&test_event_code=YOUR_TEST_CODE" \
+  -H "Content-Type: application/json" \
+  -d '{"data":[{"event_name":"Purchase","event_time":'$(date +%s)',"action_source":"website","event_source_url":"http://127.0.0.1:5000","custom_data":{"currency":"USD","value":12.34}}]}'
+
+- If cURL shows success but Events Manager doesn't, wait a minute and refresh Test Events.
+- Set `DRY_RUN=1` to suppress outbound posts while testing UI.
