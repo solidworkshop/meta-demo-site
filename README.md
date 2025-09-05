@@ -1,55 +1,25 @@
-# E-commerce Simulator (Light Mode) — with `.env` support
+# E-commerce Simulator — Full Build (.env + Gunicorn-ready)
 
-A self-contained Flask app to simulate Meta Pixel & Conversions API (CAPI) traffic with rich controls.
-
-## Features
-- Three columns:
-  1) **Manual Sender** (Pixel / CAPI / Both)
-  2) **Pixel Auto (browser)** – simulated loop from client
-  3) **CAPI Auto (server)** – background loop on the server
-- Per-column **Advanced Controls** and **Discrepancy & Chaos** (bad data toggles).
-- **Master** enable/disable switches for Pixel and CAPI.
-- **Margin** is sent as the event `value` and also included in `custom_data` along with `price`, `currency`, and `pltv`.
-- **Delay**, **match-rate degradation**, **currency (Auto/Null/specific)**.
-- Product **catalog** and **product pages** with unique URLs.
-
-## Quickstart
+## Quickstart (local)
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
-cp .env.example .env
-# edit .env and set PIXEL_ID, ACCESS_TOKEN, etc.
-
+cp .env.example .env && nano .env   # set PIXEL_ID, ACCESS_TOKEN, etc.
 python app.py
 ```
 
-Open http://127.0.0.1:5000
-
-> If `PIXEL_ID` or `ACCESS_TOKEN` is missing, CAPI requests are simulated and marked as such; Pixel is always simulated on the server for visibility.
-
-## Deploying to Render
-- Set **Start Command**: `python app.py`
-- Add Environment (or keep them in a private `.env` if your host supports it):
-  - `PIXEL_ID`
-  - `ACCESS_TOKEN`
-  - `TEST_EVENT_CODE` (optional)
-  - `GRAPH_VER` (e.g., `v21.0`)
-  - `BASE_URL` (your Render URL)
-  - `DEFAULT_CATALOG_SIZE`
-- Expose port **5000**.
-
-## Endpoints
-- `GET /` — Main UI
-- `GET /catalog` — Grid view of products
-- `GET /product/<sku>` — Product detail
-- `POST /api/master` — Toggle master Pixel/CAPI
-- `POST /api/catalog/size` — Set number of unique products
-- `POST /api/manual/send` — Send one event (Pixel/CAPI/Both)
-- `POST /api/server_auto/start` — Start server loop (CAPI)
-- `POST /api/server_auto/stop` — Stop server loop
+## Deploy (Render or similar)
+- **Start Command (simple):**
+  ```bash
+  python app.py
+  ```
+- **Start Command (gunicorn):**
+  ```bash
+  gunicorn -w 4 -b 0.0.0.0:5000 app:app
+  ```
+- **Env Vars:** set `PIXEL_ID`, `ACCESS_TOKEN`, `TEST_EVENT_CODE` (optional), `GRAPH_VER`, `BASE_URL`, `DEFAULT_CATALOG_SIZE`.
 
 ## Notes
-- Button feedback uses **border flash**: green on success; red persists for errors.
-- Server auto loop is a daemon thread. Stopping the service also stops the loop.
-- Delay is capped at 3000ms per event to keep the UI responsive.
+- If `PIXEL_ID`/`ACCESS_TOKEN` not set, CAPI calls are simulated and marked in the response.
+- Catalog size uses app state: `STATE["default_catalog_size"]` (no global mutation).
+- Buttons flash green on success; red border persists on error.

@@ -1,7 +1,12 @@
 #!/usr/bin/env python3
 """
-E-commerce Simulator (Light Mode) — Full Project with .env support and Option A fix
-- Uses STATE["default_catalog_size"] instead of global DEFAULT_CATALOG_SIZE
+E-commerce Simulator — Full Project
+- .env support via python-dotenv
+- Option A fix: uses STATE["default_catalog_size"] (no global mutation)
+- Three columns: Manual Sender, Pixel Auto (browser), CAPI Auto (server)
+- Per-column Advanced & Chaos controls
+- Catalog with product pages
+- Button border flash feedback
 """
 import os, json, time, uuid, random, hashlib, threading
 from datetime import datetime, timezone
@@ -13,7 +18,7 @@ from dotenv import load_dotenv
 # Load .env if present
 load_dotenv()
 
-# Env vars
+# --------------------------- ENV ---------------------------
 PIXEL_ID        = os.getenv("PIXEL_ID", "")
 ACCESS_TOKEN    = os.getenv("ACCESS_TOKEN", "")
 TEST_EVENT_CODE = os.getenv("TEST_EVENT_CODE", "")
@@ -26,11 +31,16 @@ def capi_url() -> Optional[str]:
         return f"https://graph.facebook.com/{GRAPH_VER}/{PIXEL_ID}/events"
     return None
 
+# --------------------------- APP ---------------------------
 app = Flask(__name__)
+
+# --------------------------- STATE ---------------------------
+class CatalogItem(Dict[str, Any]):
+    pass
 
 STATE = {
     "master": {"pixel_enabled": True, "capi_enabled": True},
-    "catalog": {},
+    "catalog": {},  # sku -> item
     "server_auto": {
         "running": False,
         "interval_ms": 2000,
@@ -49,6 +59,7 @@ STATE = {
 
 CATALOG_LOCK = threading.Lock()
 
+# --------------------------- HELPERS ---------------------------
 def ensure_catalog(size: int) -> None:
     with CATALOG_LOCK:
         current = len(STATE["catalog"])
@@ -79,7 +90,8 @@ def rand_user_data(degrade_pct: int) -> Dict[str, Any]:
 
 def compute_margin(price: Optional[float], cost_min: int, cost_max: int) -> Optional[float]:
     if price is None: return None
-    cost_pct = random.uniform(min(cost_min, cost_max), max(cost_min, cost_max)) / 100.0
+    cmin, cmax = sorted([max(0, min(cost_min, 99)), max(0, min(cost_max, 99))])
+    cost_pct = random.uniform(cmin, cmax) / 100.0
     cost = round(price * cost_pct, 2)
     return round(price - cost, 2)
 
@@ -99,7 +111,7 @@ def send_capi(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not STATE["master"]["capi_enabled"]:
         return {"ok": False, "error": "CAPI disabled by master switch."}
     if not url:
-        return {"ok": True, "kind": "capi-simulated", "echo": payload}
+        return {"ok": True, "kind": "capi-simulated", "echo": payload, "note": "PIXEL_ID/ACCESS_TOKEN not set"}
     try:
         resp = requests.post(
             url,
@@ -108,26 +120,39 @@ def send_capi(payload: Dict[str, Any]) -> Dict[str, Any]:
             timeout=10,
         )
         ok = resp.status_code == 200
-        return {"ok": ok, "status": resp.status_code, "body": resp.json() if resp.content else {}}
+        try:
+            body = resp.json() if resp.content else {}
+        except Exception:
+            body = {"raw_text": resp.text}
+        return {"ok": ok, "status": resp.status_code, "body": body}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-def build_event(event_name: str, item: Dict[str, Any], controls: Dict[str, Any]) -> Dict[str, Any]:
+def build_event(event_name: str, item: CatalogItem, controls: Dict[str, Any]) -> Dict[str, Any]:
     price = item.get("price")
-    bad = controls.get("bad_nulls", {})
-    margin = compute_margin(price, controls.get("cost_pct_min",20), controls.get("cost_pct_max",60))
-    currency = pick_currency(controls.get("currency","Auto"))
+    currency_sel = controls.get("currency", "Auto")
+    bad = controls.get("bad_nulls", {"price": False, "currency": False, "event_id": False})
+    cost_min = int(controls.get("cost_pct_min", 20))
+    cost_max = int(controls.get("cost_pct_max", 60))
+    degrade = int(controls.get("match_rate_degrade_pct", 0))
+    delay_ms = int(controls.get("delay_ms", 0))
+    pltv = float(controls.get("pltv", 0.0))
+
+    if delay_ms > 0:
+        time.sleep(min(delay_ms, 3000)/1000.0)
+
+    margin = compute_margin(price, cost_min, cost_max)
+    currency = pick_currency(currency_sel)
     payload_event_id = None if bad.get("event_id") else str(uuid.uuid4())
-    if controls.get("delay_ms",0) > 0:
-        time.sleep(min(int(controls["delay_ms"]),3000)/1000.0)
-    return {
+
+    event = {
         "data": [{
             "event_name": event_name,
             "event_time": int(time.time()),
             "event_id": payload_event_id,
             "action_source": "website",
             "event_source_url": item.get("url"),
-            "user_data": rand_user_data(int(controls.get("match_rate_degrade_pct",0))),
+            "user_data": rand_user_data(degrade),
             "custom_data": {
                 "content_ids": [item.get("sku")],
                 "content_type": "product",
@@ -135,12 +160,14 @@ def build_event(event_name: str, item: Dict[str, Any], controls: Dict[str, Any])
                 "value": maybe(margin, bad.get("price")),
                 "currency": maybe(currency, bad.get("currency")),
                 "price": maybe(price, bad.get("price")),
-                "pltv": float(controls.get("pltv",0.0)),
+                "pltv": pltv,
                 "margin": margin,
             }
         }]
     }
+    return event
 
+# --------------------------- ROUTES ---------------------------
 @app.route("/")
 def index():
     ensure_catalog(STATE["default_catalog_size"])
@@ -166,6 +193,13 @@ def product(sku):
         return redirect(url_for("catalog"))
     return render_template("product.html", item=item)
 
+@app.post("/api/master")
+def api_master():
+    data = request.json or {}
+    STATE["master"]["pixel_enabled"] = bool(data.get("pixel_enabled", STATE["master"]["pixel_enabled"]))
+    STATE["master"]["capi_enabled"] = bool(data.get("capi_enabled", STATE["master"]["capi_enabled"]))
+    return jsonify({"ok": True, "master": STATE["master"]})
+
 @app.post("/api/catalog/size")
 def api_catalog_size():
     data = request.json or {}
@@ -175,7 +209,71 @@ def api_catalog_size():
     ensure_catalog(size)
     return jsonify({"ok": True, "size": size})
 
-# other routes omitted for brevity (manual send, server auto, master switches) ... same as before
+@app.post("/api/manual/send")
+def api_manual_send():
+    data = request.json or {}
+    channel = data.get("channel", "both")
+    event_name = data.get("event", "Purchase")
+    controls = data.get("controls", {})
+    sku = data.get("sku")
+
+    ensure_catalog(STATE["default_catalog_size"])
+    with CATALOG_LOCK:
+        item = STATE["catalog"].get(sku) if sku else random.choice(list(STATE["catalog"].values()))
+
+    payload = build_event(event_name, item, controls)
+
+    results = []
+    if channel in ("pixel", "both"):
+        if not STATE["master"]["pixel_enabled"]:
+            results.append({"ok": False, "error": "Pixel disabled by master switch."})
+        else:
+            results.append(send_pixel_stub(payload))
+    if channel in ("capi", "both"):
+        results.append(send_capi(payload))
+
+    ok = all(r.get("ok") for r in results)
+    return jsonify({"ok": ok, "results": results, "sent_payload": payload})
+
+def _server_auto_loop():
+    while not STATE["server_auto"]["stop_flag"]:
+        controls = {
+            "bad_nulls": STATE["server_auto"]["bad_nulls"],
+            "cost_pct_min": STATE["server_auto"]["cost_pct_min"],
+            "cost_pct_max": STATE["server_auto"]["cost_pct_max"],
+            "currency": STATE["server_auto"]["currency"],
+            "delay_ms": STATE["server_auto"]["delay_ms"],
+            "match_rate_degrade_pct": STATE["server_auto"]["match_rate_degrade_pct"],
+            "pltv": STATE["server_auto"]["pltv"],
+        }
+        ensure_catalog(STATE["default_catalog_size"])
+        with CATALOG_LOCK:
+            item = random.choice(list(STATE["catalog"].values()))
+        payload = build_event("Purchase", item, controls)
+        send_capi(payload)
+        time.sleep(max(0.2, STATE["server_auto"]["interval_ms"]/1000.0))
+    STATE["server_auto"]["running"] = False
+
+@app.post("/api/server_auto/start")
+def api_server_auto_start():
+    data = request.json or {}
+    STATE["server_auto"]["interval_ms"] = int(data.get("interval_ms", STATE["server_auto"]["interval_ms"]))
+    for k in ("bad_nulls","cost_pct_min","cost_pct_max","currency","delay_ms","match_rate_degrade_pct","pltv"):
+        if k in data:
+            STATE["server_auto"][k] = data[k]
+    if STATE["server_auto"]["running"]:
+        return jsonify({"ok": True, "running": True})
+    STATE["server_auto"]["stop_flag"] = False
+    th = threading.Thread(target=_server_auto_loop, daemon=True)
+    STATE["server_auto"]["thread"] = th
+    STATE["server_auto"]["running"] = True
+    th.start()
+    return jsonify({"ok": True, "running": True})
+
+@app.post("/api/server_auto/stop")
+def api_server_auto_stop():
+    STATE["server_auto"]["stop_flag"] = True
+    return jsonify({"ok": True, "running": False})
 
 @app.get("/healthz")
 def healthz():
