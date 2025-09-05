@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-E-commerce Simulator — Full Fixed v4
-- Based on polished v3 (all features intact)
-- Adds green info banner if no .env file is present (assume Render env vars)
+E-commerce Simulator — Full Final v4
+- Complete simulator (Meta Pixel, CAPI, Manual, Catalog)
+- Green banner if no .env file (assume Render env vars)
+- Orange banner if CAPI creds missing
 """
 import os, json, time, uuid, random, hashlib, threading
 from datetime import datetime, timezone
@@ -54,6 +55,12 @@ def ensure_catalog(size: int) -> None:
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+# Health check
+@app.get("/healthz")
+def healthz():
+    return jsonify({"ok": True, "time": now_iso()})
+
+# Index page
 @app.get("/")
 def index():
     ensure_catalog(STATE["default_catalog_size"])
@@ -67,9 +74,20 @@ def index():
         env_file_exists=ENV_FILE_EXISTS,
     )
 
-@app.get("/healthz")
-def healthz():
-    return jsonify({"ok": True, "time": now_iso()})
+# Catalog page
+@app.get("/catalog")
+def catalog():
+    ensure_catalog(STATE["default_catalog_size"])
+    items = list(STATE["catalog"].values())
+    return render_template("catalog.html", items=items)
+
+# Product detail page
+@app.get("/product/<sku>")
+def product(sku):
+    ensure_catalog(STATE["default_catalog_size"])
+    item = STATE["catalog"].get(sku)
+    if not item: return redirect(url_for("catalog"))
+    return render_template("product.html", item=item)
 
 if __name__ == "__main__":
     ensure_catalog(STATE["default_catalog_size"])

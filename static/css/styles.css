@@ -1,8 +1,16 @@
-body{margin:0;font-family:system-ui,sans-serif;background:#f8fafc;color:#0b1220}
-header{display:flex;align-items:center;justify-content:space-between;padding:18px 22px;background:#fff;border-bottom:1px solid #e5e7eb}
-header h1{font-size:20px;margin:0}
-header nav a{margin-left:12px;text-decoration:none;color:#374151}
-.card{background:#fff;border:1px solid #e5e7eb;border-radius:12px;padding:14px;margin:16px 0}
-.banner{margin:16px;border-radius:12px;padding:12px 14px}
+body{margin:0;font-family:sans-serif;background:#f8fafc;color:#0b1220}
+header{display:flex;justify-content:space-between;align-items:center;padding:12px 16px;background:#fff;border-bottom:1px solid #ddd}
+header h1{margin:0;font-size:20px}
+nav a{margin-left:12px;text-decoration:none;color:#374151}
+.card{background:#fff;border:1px solid #ddd;border-radius:8px;padding:12px;margin:12px}
+.banner{margin:12px;border-radius:8px;padding:10px}
 .banner-info{background:#ecfdf5;border:1px solid #6ee7b7;color:#065f46}
 .banner-warn{background:#fff7ed;border:1px solid #fed7aa;color:#7c2d12}
+.catalog{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;padding:12px}
+.product img{width:100%;border-radius:8px}
+.product .pinfo{padding:8px}
+.product .name{font-weight:bold}
+.product .sku{font-size:12px;color:#666}
+.product .price{color:#16a34a;font-weight:bold}
+.product-detail{display:grid;grid-template-columns:2fr 1fr;gap:16px;padding:16px}
+.product-detail img{width:100%;border-radius:8px;border:1px solid #ddd}

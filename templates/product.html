@@ -3,25 +3,17 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{{ item.name }} — E-commerce Simulator</title>
+  <title>{{ item.name }}</title>
   <link rel="stylesheet" href="/static/css/styles.css" />
 </head>
-<body class="light">
-  <header>
-    <h1>{{ item.name }}</h1>
-    <nav>
-      <a href="/">Home</a>
-      <a href="/catalog">Catalog</a>
-    </nav>
-  </header>
-
+<body>
+  <header><h1>{{ item.name }}</h1><nav><a href="/">Home</a><a href="/catalog">Catalog</a></nav></header>
   <main class="product-detail">
-    <img src="{{ item.image }}" alt="{{ item.name }}" />
+    <img src="{{ item.image }}" alt="{{ item.name }}">
     <div class="meta">
       <div><b>SKU:</b> {{ item.sku }}</div>
       <div><b>Price:</b> ${{ '%.2f'|format(item.price) }}</div>
       <div><b>URL:</b> <code>{{ item.url }}</code></div>
-      <p>Use the controls on the home page to send pixel or CAPI events containing this SKU.</p>
     </div>
   </main>
 </body>
