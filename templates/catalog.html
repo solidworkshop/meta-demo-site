@@ -1,25 +1,30 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <title>Catalog</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <link rel="stylesheet" href="/static/app.css">
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Catalog — E‑commerce Simulator</title>
+  <link rel="stylesheet" href="/static/css/styles.css" />
 </head>
-<body>
-  <header class="topbar">
+<body class="light">
+  <header>
     <h1>Catalog</h1>
     <nav>
       <a href="/">Home</a>
+      <a href="/catalog">Catalog</a>
     </nav>
   </header>
+
   <main class="catalog">
-    {% for it in items %}
-      <a class="item" href="{{ it.url }}">
-        <strong>{{ it.name }}</strong>
-        <span>{{ it.sku }}</span>
-        <em>${{ '%.2f'|format(it.price) }}</em>
-      </a>
+    {% for item in items %}
+    <a class="card product" href="/product/{{ item.sku }}">
+      <img src="{{ item.image }}" alt="{{ item.name }}" />
+      <div class="pinfo">
+        <div class="name">{{ item.name }}</div>
+        <div class="sku">{{ item.sku }}</div>
+        <div class="price">${{ '%.2f'|format(item.price) }}</div>
+      </div>
+    </a>
     {% endfor %}
   </main>
 </body>
