@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Flask app: Demo page (Meta Pixel + buttons), /ingest (CAPI forwarder),
 # Start/Stop auto streamer (server-side CAPI events), Advanced Controls,
-# and toggles to send deliberately "bad" data (null price/currency/event_id).
+# Bad data toggles, and new Margin + PLTV appends.
 import os, json, hashlib, time, random, uuid, threading
 from datetime import datetime, timezone
 from flask import Flask, request, Response, jsonify, has_request_context
@@ -32,10 +32,17 @@ CONFIG = {
     "shipping_options": [4.99, 6.99, 9.99],
     "tax_rate": 0.08,             # 8% demo tax
 
-    # NEW: bad data toggles (apply to Pixel + CAPI)
+    # Bad data toggles (apply to Pixel + CAPI)
     "null_price": False,
     "null_currency": False,
     "null_event_id": False,
+
+    # NEW: Append extra metrics
+    "append_margin": True,        # whether to include "margin" in custom_data
+    "margin_rate": 0.35,          # margin = merchandise_subtotal * margin_rate (0..1)
+    "append_pltv": True,          # whether to include "predicted_ltv" in custom_data
+    "pltv_min": 120.0,            # PLTV lower bound
+    "pltv_max": 600.0,            # PLTV upper bound
 }
 
 # ---------- helpers ----------
@@ -67,12 +74,53 @@ def build_contents(lines):
     # lines: [{"product_id","qty","price"}]
     return [{"id": li["product_id"], "quantity": int(li["qty"]), "item_price": float(li["price"])} for li in lines]
 
+def contents_subtotal(contents):
+    s = 0.0
+    for c in contents or []:
+        try:
+            q = float(c.get("quantity", 0))
+            p = float(c.get("item_price", 0))
+            s += q * p
+        except Exception:
+            pass
+    return round(s, 2)
+
 def get_cfg_snapshot():
     with CONFIG_LOCK:
         return dict(CONFIG)
 
+def append_margin_pltv(custom_data, cfg, fallback_value=None, contents=None):
+    """Append margin and predicted_ltv as requested."""
+    if custom_data is None:
+        custom_data = {}
+
+    # Merchandise subtotal: prefer contents, else fallback on provided value
+    subtotal = None
+    if contents:
+        subtotal = contents_subtotal(contents)
+    elif fallback_value is not None:
+        try:
+            subtotal = float(fallback_value)
+        except Exception:
+            subtotal = None
+
+    # margin
+    if cfg.get("append_margin") and subtotal is not None:
+        mr = float(cfg.get("margin_rate", 0.0))
+        custom_data["margin"] = round(max(0.0, mr) * max(0.0, subtotal), 2)
+
+    # predicted_ltv (PLTV)
+    if cfg.get("append_pltv"):
+        lo = float(cfg.get("pltv_min", 0.0))
+        hi = float(cfg.get("pltv_max", max(lo, 0.0)))
+        if hi < lo:
+            hi = lo
+        custom_data["predicted_ltv"] = round(random.uniform(lo, hi), 2)
+
+    return custom_data
+
 def apply_bad_data_flags(evts):
-    """Mutate CAPI events per bad-data toggles."""
+    """Mutate CAPI events per bad-data toggles (price/currency/event_id)."""
     cfg = get_cfg_snapshot()
     if not evts:
         return evts
@@ -102,6 +150,7 @@ def map_sim_event_to_capi(e):
     ctx  = e.get("context", {})
     currency = ctx.get("currency","USD")
     ts   = iso_to_unix(e["timestamp"])
+    cfg  = get_cfg_snapshot()
 
     # infer a URL
     page = e.get("page") or "/"
@@ -133,58 +182,68 @@ def map_sim_event_to_capi(e):
 
     elif et == "product_view":
         p = e["product"]
-        out = [{**base, "event_name":"ViewContent",
-                 "custom_data":{
-                     "content_type":"product",
-                     "content_ids":[p["product_id"]],
-                     "value": float(p["price"]),
-                     "currency": currency
-                 }}]
+        cd = {
+            "content_type":"product",
+            "content_ids":[p["product_id"]],
+            "value": float(p["price"]),
+            "currency": currency
+        }
+        cd = append_margin_pltv(cd, cfg, fallback_value=cd["value"], contents=None)
+        out = [{**base, "event_name":"ViewContent", "custom_data": cd}]
 
     elif et == "add_to_cart":
         li = e["line_item"]
-        out = [{**base, "event_name":"AddToCart",
-                 "custom_data":{
-                     "content_type":"product",
-                     "content_ids":[li["product_id"]],
-                     "contents":[{"id": li["product_id"], "quantity": int(li["qty"]), "item_price": float(li["price"])}],
-                     "value": float(li["qty"]) * float(li["price"]),
-                     "currency": currency
-                 }}]
+        contents = [{"id": li["product_id"], "quantity": int(li["qty"]), "item_price": float(li["price"])}]
+        cd = {
+            "content_type":"product",
+            "content_ids":[li["product_id"]],
+            "contents": contents,
+            "value": float(li["qty"]) * float(li["price"]),
+            "currency": currency
+        }
+        cd = append_margin_pltv(cd, cfg, fallback_value=cd["value"], contents=contents)
+        out = [{**base, "event_name":"AddToCart", "custom_data": cd}]
 
     elif et == "begin_checkout":
         cart = e["cart"]
+        contents = build_contents(cart)
         total = float(e.get("total", 0.0))
-        out = [{**base, "event_name":"InitiateCheckout",
-                 "custom_data":{
-                     "contents": build_contents(cart),
-                     "value": total,
-                     "currency": currency
-                 }}]
+        cd = {
+            "contents": contents,
+            "value": total,
+            "currency": currency
+        }
+        # For margin, use merchandise subtotal (derived from contents), not total
+        cd = append_margin_pltv(cd, cfg, fallback_value=contents_subtotal(contents), contents=contents)
+        out = [{**base, "event_name":"InitiateCheckout", "custom_data": cd}]
 
     elif et == "purchase":
         items = e["items"]
+        contents = build_contents(items)
         total = float(e.get("total", 0.0))
-        out = [{**base, "event_name":"Purchase",
-                 "custom_data":{
-                     "contents": build_contents(items),
-                     "value": total,
-                     "currency": currency
-                 }}]
+        cd = {
+            "contents": contents,
+            "value": total,
+            "currency": currency
+        }
+        # Margin again on merchandise subtotal
+        cd = append_margin_pltv(cd, cfg, fallback_value=contents_subtotal(contents), contents=contents)
+        out = [{**base, "event_name":"Purchase", "custom_data": cd}]
 
     elif et == "return_initiated":
         pid = e.get("product_id")
-        out = [{**base, "event_name":"ReturnInitiated",
-                 "custom_data":{
-                     "content_type":"product",
-                     "content_ids":[pid] if pid else [],
-                     "value": 0.0, "currency": currency
-                 }}]
+        cd = {
+            "content_type":"product",
+            "content_ids":[pid] if pid else [],
+            "value": 0.0, "currency": currency
+        }
+        cd = append_margin_pltv(cd, cfg, fallback_value=0.0, contents=None)
+        out = [{**base, "event_name":"ReturnInitiated", "custom_data": cd}]
 
     # Apply bad-data toggles before returning
     return apply_bad_data_flags(out)
 
-# ---------- HTML (with success/fail icons + Advanced Controls + Bad Data toggles) ----------
+# ---------- HTML (success/fail icons + Advanced Controls + Bad Data + Margin/PLTV) ----------
 PAGE_HTML = f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -192,11 +251,11 @@ PAGE_HTML = f"""<!doctype html>
 <style>
   :root {{ --bd:#ddd; --fg:#222; --muted:#555; --ok:#0a8a30; --err:#b00020; }}
   body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; margin: 2rem; color: var(--fg); }}
-  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }}
   .card {{ border:1px solid var(--bd); border-radius:12px; padding:16px; }}
   .row {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }}
   .col {{ display:flex; flex-direction:column; gap:8px; }}
-  input[type=number], input[type=text] {{ width: 160px; padding:6px 8px; }}
+  input[type=number], input[type=text] {{ width: 170px; padding:6px 8px; }}
   .small {{ font-size: 12px; color: var(--muted); }}
 
   .btn {{
@@ -218,9 +277,8 @@ PAGE_HTML = f"""<!doctype html>
   .btn.show-err  .x    {{ opacity:1; transform: translateY(-50%) scale(1); }}
 
   .kv {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; }}
-  .kv label {{ width: 220px; font-size: 14px; color: var(--muted); }}
+  .kv label {{ width: 240px; font-size: 14px; color: var(--muted); }}
 
-  /* simple toggle style */
   .toggle {{ display:flex; align-items:center; gap:10px; }}
   .toggle input[type=checkbox] {{ width:18px; height:18px; }}
 </style>
@@ -251,59 +309,101 @@ async function fetchJSON(url) {{
   return r.json();
 }}
 
-/* Read bad-data toggles from the checkboxes on the page */
+/* Bad-data toggles from checkboxes */
 function readBadToggles(){{
-  const np = document.getElementById('null_price').checked;
-  const nc = document.getElementById('null_currency').checked;
-  const ne = document.getElementById('null_event_id').checked;
-  return {{ null_price: np, null_currency: nc, null_event_id: ne }};
+  return {{
+    null_price: document.getElementById('null_price').checked,
+    null_currency: document.getElementById('null_currency').checked,
+    null_event_id: document.getElementById('null_event_id').checked,
+  }};
 }}
 
-/* Pixel event buttons – apply toggles by setting nulls where chosen */
+/* Append controls (margin + PLTV) */
+function readAppendControls(){{
+  return {{
+    append_margin: document.getElementById('append_margin').checked,
+    margin_rate: parseFloat(document.getElementById('margin_rate').value || '0.35'),
+    append_pltv: document.getElementById('append_pltv').checked,
+    pltv_min: parseFloat(document.getElementById('pltv_min').value || '120'),
+    pltv_max: parseFloat(document.getElementById('pltv_max').value || '600'),
+  }};
+}}
+function randBetween(a,b){{ const lo=Math.min(a,b), hi=Math.max(a,b); return lo + Math.random()*(hi-lo); }}
+
+/* Pixel event helpers: attach margin & predicted_ltv if toggled */
+function attachMarginPltv(payload, valueForMargin){{
+  const a = readAppendControls();
+  if (a.append_margin && typeof valueForMargin === 'number') {{
+    const mr = Math.max(0, a.margin_rate || 0);
+    payload.margin = Math.round(valueForMargin * mr * 100)/100;
+  }}
+  if (a.append_pltv) {{
+    const pltv = randBetween(a.pltv_min||0, a.pltv_max||0);
+    payload.predicted_ltv = Math.round(pltv*100)/100;
+  }}
+}}
+
+/* Pixel event buttons */
 function sendView(btn){{
-  const t = readBadToggles();
+  const bad = readBadToggles();
+  const price = 68.99;
   const payload = {{
     content_type:'product',
     content_ids:['SKU-10057'],
-    currency: t.null_currency ? null : 'USD',
-    value: t.null_price ? null : 68.99
+    currency: bad.null_currency ? null : 'USD',
+    value: bad.null_price ? null : price
   }};
-  const opts = {{ eventID: t.null_event_id ? null : rid() }};
+  attachMarginPltv(payload, price);
+  const opts = {{ eventID: bad.null_event_id ? null : rid() }};
   fbq('track', 'ViewContent', payload, opts);
   flashIcon(btn, true);
 }}
 function sendATC(btn){{
-  const t = readBadToggles();
+  const bad = readBadToggles();
+  const price = 68.99;
+  const qty = 1;
+  const value = qty*price;
   const payload = {{
     content_type:'product',
     content_ids:['SKU-10057'],
-    contents:[{{id:'SKU-10057', quantity:1, item_price: t.null_price ? null : 68.99}}],
-    currency: t.null_currency ? null : 'USD',
-    value: t.null_price ? null : 68.99
+    contents:[{{id:'SKU-10057', quantity:qty, item_price: bad.null_price ? null : price}}],
+    currency: bad.null_currency ? null : 'USD',
+    value: bad.null_price ? null : value
   }};
-  const opts = {{ eventID: t.null_event_id ? null : rid() }};
+  attachMarginPltv(payload, value);
+  const opts = {{ eventID: bad.null_event_id ? null : rid() }};
   fbq('track', 'AddToCart', payload, opts);
   flashIcon(btn, true);
 }}
 function sendInitiate(btn){{
-  const t = readBadToggles();
+  const bad = readBadToggles();
+  const price = 68.99;
+  const qty = 2;
+  const subtotal = qty*price;
+  const total = 149.02; // demo number; margin uses merchandise subtotal
   const payload = {{
-    contents:[{{id:'SKU-10057', quantity:2, item_price: t.null_price ? null : 68.99}}],
-    currency: t.null_currency ? null : 'USD',
-    value: t.null_price ? null : 149.02
+    contents:[{{id:'SKU-10057', quantity:qty, item_price: bad.null_price ? null : price}}],
+    currency: bad.null_currency ? null : 'USD',
+    value: bad.null_price ? null : total
   }};
-  const opts = {{ eventID: t.null_event_id ? null : rid() }};
+  attachMarginPltv(payload, subtotal);
+  const opts = {{ eventID: bad.null_event_id ? null : rid() }};
   fbq('track', 'InitiateCheckout', payload, opts);
   flashIcon(btn, true);
 }}
 function sendPurchase(btn){{
-  const t = readBadToggles();
+  const bad = readBadToggles();
+  const price = 68.99;
+  const qty = 2;
+  const subtotal = qty*price;
+  const total = 149.02;
   const payload = {{
-    contents:[{{id:'SKU-10057', quantity:2, item_price: t.null_price ? null : 68.99}}],
-    currency: t.null_currency ? null : 'USD',
-    value: t.null_price ? null : 149.02
+    contents:[{{id:'SKU-10057', quantity:qty, item_price: bad.null_price ? null : price}}],
+    currency: bad.null_currency ? null : 'USD',
+    value: bad.null_price ? null : total
   }};
-  const opts = {{ eventID: t.null_event_id ? null : rid() }};
+  attachMarginPltv(payload, subtotal);
+  const opts = {{ eventID: bad.null_event_id ? null : rid() }};
   fbq('track', 'Purchase', payload, opts);
   flashIcon(btn, true);
 }}
@@ -333,7 +433,7 @@ async function stopAuto(btn){{
   setTimeout(refreshStatus, 250);
 }}
 
-/* Advanced controls (read + write) */
+/* Advanced + toggles (read + write) */
 async function loadConfig(){{
   try {{
     const cfg = await fetchJSON('/auto/config');
@@ -351,10 +451,16 @@ async function loadConfig(){{
     document.getElementById('null_price').checked = !!cfg.null_price;
     document.getElementById('null_currency').checked = !!cfg.null_currency;
     document.getElementById('null_event_id').checked = !!cfg.null_event_id;
+
+    // NEW: margin + PLTV
+    document.getElementById('append_margin').checked = !!cfg.append_margin;
+    document.getElementById('margin_rate').value = cfg.margin_rate;
+    document.getElementById('append_pltv').checked = !!cfg.append_pltv;
+    document.getElementById('pltv_min').value = cfg.pltv_min;
+    document.getElementById('pltv_max').value = cfg.pltv_max;
   }} catch (e) {{}}
 }}
 async function saveConfig(btn){{
-  // collect values
   const body = {{
     rps: parseFloat(document.getElementById('rps').value || '0.5'),
     p_add_to_cart: parseFloat(document.getElementById('p_add_to_cart').value || '0.35'),
@@ -371,6 +477,13 @@ async function saveConfig(btn){{
     null_price: document.getElementById('null_price').checked,
     null_currency: document.getElementById('null_currency').checked,
     null_event_id: document.getElementById('null_event_id').checked,
+
+    // NEW: margin + PLTV appends
+    append_margin: document.getElementById('append_margin').checked,
+    margin_rate: parseFloat(document.getElementById('margin_rate').value || '0.35'),
+    append_pltv: document.getElementById('append_pltv').checked,
+    pltv_min: parseFloat(document.getElementById('pltv_min').value || '120'),
+    pltv_max: parseFloat(document.getElementById('pltv_max').value || '600'),
   }};
   const ok = await fetchOK('/auto/config', {{
     method: 'POST',
@@ -396,12 +509,8 @@ window.addEventListener('load', () => {{ refreshStatus(); loadConfig(); }});
       <h3>ViewContent</h3>
       <button class="btn" onclick="sendView(this)">
         Send ViewContent
-        <span class="tick" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg>
-        </span>
-        <span class="x" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg>
-        </span>
+        <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
+        <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
       </button>
     </div>
 
@@ -409,12 +518,8 @@ window.addEventListener('load', () => {{ refreshStatus(); loadConfig(); }});
       <h3>AddToCart</h3>
       <button class="btn" onclick="sendATC(this)">
         Send AddToCart
-        <span class="tick" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg>
-        </span>
-        <span class="x" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg>
-        </span>
+        <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
+        <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
       </button>
     </div>
 
@@ -422,12 +527,8 @@ window.addEventListener('load', () => {{ refreshStatus(); loadConfig(); }});
       <h3>InitiateCheckout</h3>
       <button class="btn" onclick="sendInitiate(this)">
         Send InitiateCheckout
-        <span class="tick" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg>
-        </span>
-        <span class="x" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg>
-        </span>
+        <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
+        <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
       </button>
     </div>
 
@@ -435,12 +536,8 @@ window.addEventListener('load', () => {{ refreshStatus(); loadConfig(); }});
       <h3>Purchase</h3>
       <button class="btn" onclick="sendPurchase(this)">
         Send Purchase
-        <span class="tick" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg>
-        </span>
-        <span class="x" aria-hidden="true">
-          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg>
-        </span>
+        <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
+        <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
       </button>
     </div>
 
@@ -454,27 +551,19 @@ window.addEventListener('load', () => {{ refreshStatus(); loadConfig(); }});
       <div class="row">
         <button id="startBtn" class="btn" onclick="startAuto(this)">
           Start Auto Stream
-          <span class="tick" aria-hidden="true">
-            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg>
-          </span>
-          <span class="x" aria-hidden="true">
-            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg>
-          </span>
+          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
+          <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
         </button>
         <button id="stopBtn" class="btn" onclick="stopAuto(this)">
-            Stop
-            <span class="tick" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg>
-            </span>
-            <span class="x" aria-hidden="true">
-              <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg>
-            </span>
+          Stop
+          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
+          <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
         </button>
       </div>
       <p id="status" class="small">…</p>
     </div>
 
-    <!-- Advanced Controls + Bad Data toggles -->
+    <!-- Advanced Controls + Bad Data + Margin/PLTV -->
     <div class="card">
       <h3>Advanced Controls</h3>
       <div class="col">
@@ -491,19 +580,22 @@ window.addEventListener('load', () => {{ refreshStatus(); loadConfig(); }});
         <div class="kv toggle"><input id="null_price" type="checkbox"/><label for="null_price">Send <b>null price</b> (value & item_price)</label></div>
         <div class="kv toggle"><input id="null_currency" type="checkbox"/><label for="null_currency">Send <b>null currency</b></label></div>
         <div class="kv toggle"><input id="null_event_id" type="checkbox"/><label for="null_event_id">Send <b>null event_id</b></label></div>
+
+        <hr style="width:100%; border:none; border-top:1px solid var(--bd); margin:8px 0;">
+        <div class="kv toggle"><input id="append_margin" type="checkbox" checked/><label for="append_margin">Append <b>margin</b> to custom_data</label></div>
+        <div class="kv"><label for="margin_rate">Margin rate (0–1):</label><input id="margin_rate" type="number" step="0.01" min="0" max="1" value="0.35"/></div>
+        <div class="kv toggle"><input id="append_pltv" type="checkbox" checked/><label for="append_pltv">Append <b>predicted_ltv</b> (PLTV)</label></div>
+        <div class="kv"><label for="pltv_min">PLTV min ($):</label><input id="pltv_min" type="number" step="0.01" min="0" value="120"/></div>
+        <div class="kv"><label for="pltv_max">PLTV max ($):</label><input id="pltv_max" type="number" step="0.01" min="0" value="600"/></div>
       </div>
       <div class="row" style="margin-top:8px;">
         <button class="btn" onclick="saveConfig(this)">
           Save Controls
-          <span class="tick" aria-hidden="true">
-            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg>
-          </span>
-          <span class="x" aria-hidden="true">
-            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg>
-          </span>
+          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
+          <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
         </button>
       </div>
-      <p class="small">Tip: Save while running to change behavior on the fly. Bad-data toggles affect both Pixel and server (CAPI) events.</p>
+      <p class="small">Tip: Save while running to change behavior on the fly. Bad-data + Margin/PLTV apply to Pixel and server CAPI.</p>
     </div>
   </div>
 </body></html>
@@ -594,10 +686,24 @@ def auto_config():
         if "tax_rate" in body:
             CONFIG["tax_rate"] = _clamp(body["tax_rate"], 0.0, 1.0, CONFIG["tax_rate"])
 
-        # NEW: bad-data toggles
+        # bad-data toggles
         for b in ("null_price", "null_currency", "null_event_id"):
             if b in body:
                 CONFIG[b] = _to_bool(body[b], CONFIG[b])
+
+        # NEW: margin + PLTV settings
+        if "append_margin" in body:
+            CONFIG["append_margin"] = _to_bool(body["append_margin"], CONFIG["append_margin"])
+        if "margin_rate" in body:
+            CONFIG["margin_rate"] = _clamp(body["margin_rate"], 0.0, 1.0, CONFIG["margin_rate"])
+        if "append_pltv" in body:
+            CONFIG["append_pltv"] = _to_bool(body["append_pltv"], CONFIG["append_pltv"])
+        if "pltv_min" in body:
+            CONFIG["pltv_min"] = _clamp(body["pltv_min"], 0.0, 1e7, CONFIG["pltv_min"])
+        if "pltv_max" in body:
+            # keep max >= min
+            proposed = _clamp(body["pltv_max"], CONFIG["pltv_min"], 1e7, CONFIG["pltv_max"])
+            CONFIG["pltv_max"] = max(proposed, CONFIG["pltv_min"])
 
     return jsonify({"ok": True, "config": CONFIG})
 
@@ -648,10 +754,10 @@ def _event_base(session, **extra):
         **extra
     }
 
-def _send_simulated_session_once(cfg_snapshot):
+def _send_simulated_session_once(cfg):
     """Generate a short funnel and push directly to CAPI (no HTTP back to /ingest)."""
     s = _make_session()
-    product = _make_product(cfg_snapshot)
+    product = _make_product(cfg)
 
     # page_view and product_view
     for evt in [
@@ -664,7 +770,7 @@ def _send_simulated_session_once(cfg_snapshot):
             except Exception: pass
 
     # add_to_cart?
-    if random.random() < cfg_snapshot["p_add_to_cart"]:
+    if random.random() < cfg["p_add_to_cart"]:
         qty = _pick([1,1,1,2])
         line = {"product_id": product["product_id"], "qty": qty, "price": product["price"]}
         evt = _event_base(s, event_type="add_to_cart", line_item=line, cart_size=1)
@@ -674,13 +780,13 @@ def _send_simulated_session_once(cfg_snapshot):
         except Exception: pass
 
         # begin_checkout?
-        if random.random() < cfg_snapshot["p_begin_checkout"]:
+        if random.random() < cfg["p_begin_checkout"]:
             subtotal = qty * product["price"]
-            if subtotal >= cfg_snapshot["free_shipping_threshold"]:
+            if subtotal >= cfg["free_shipping_threshold"]:
                 shipping = 0.0
             else:
-                shipping = _pick(cfg_snapshot["shipping_options"]) if cfg_snapshot["shipping_options"] else 0.0
-            tax = round(cfg_snapshot["tax_rate"] * subtotal, 2)
+                shipping = _pick(cfg["shipping_options"]) if cfg["shipping_options"] else 0.0
+            tax = round(cfg["tax_rate"] * subtotal, 2)
             total = round(subtotal+shipping+tax, 2)
             cart = [line]
             evt = _event_base(s, event_type="begin_checkout",
@@ -692,7 +798,7 @@ def _send_simulated_session_once(cfg_snapshot):
             except Exception: pass
 
             # purchase?
-            if random.random() < cfg_snapshot["p_purchase"]:
+            if random.random() < cfg["p_purchase"]:
                 evt = _event_base(s, event_type="purchase", items=cart,
                                   subtotal=round(subtotal,2), shipping=shipping,
                                   tax=tax, total=total,
@@ -706,15 +812,13 @@ def _send_simulated_session_once(cfg_snapshot):
 def _auto_loop():
     # runs until _stop_evt is set
     while not _stop_evt.is_set():
-        # snapshot config under lock so we read a stable set
         with CONFIG_LOCK:
-            cfg = dict(CONFIG)
+            cfg = dict(CONFIG)  # snapshot
         start = time.time()
         try:
             _send_simulated_session_once(cfg)
         except Exception:
             pass
-        # respect rps
         delay = max(0.05, 1.0 / max(0.1, cfg["rps"]))  # clamp 0.1..10 via save endpoint
         elapsed = time.time() - start
         _stop_evt.wait(max(0.0, delay - elapsed))
@@ -722,7 +826,6 @@ def _auto_loop():
 @app.route("/auto/start")
 def auto_start():
     global _auto_thread
-    # optional: override rps via query param
     q = request.args.get("rps", None)
     if q is not None:
         try: qv = float(q)
@@ -730,7 +833,6 @@ def auto_start():
         if qv is not None:
             with CONFIG_LOCK:
                 CONFIG["rps"] = max(0.1, min(10.0, qv))
-    # start thread if not running
     if _auto_thread is not None and _auto_thread.is_alive():
         with CONFIG_LOCK:
             return jsonify({"ok": True, "running": True, "rps": round(CONFIG["rps"],2)})
