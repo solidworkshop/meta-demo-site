@@ -1,20 +1,31 @@
-# E-commerce Simulator v2.1.5
+# Store Simulator v2.1.6
 
-Adds **CAPI user_data toggles** for:
-- Hashed Email (`em`)
-- Client IP (`client_ip_address`)
-- User Agent (`client_user_agent`)
-- Browser ID (`fbp`)
-- Click ID (`fbc`)
+Fixes:
+- Title no longer says "Demo".
+- Pulsing dots show active status for Pixel Auto (browser) and Server Auto.
+- Discrepancy & Chaos panel has a persistent on/off toggle; inputs disabled when off.
+- Self-test buttons (Pixel) are present.
+- Toggle to "Share event_id to CAPI" (also in Advanced Controls). When enabled, pixel telemetry is forwarded to CAPI using the same event_id for dedup.
+- `/chaos/reset` sets all chaos/discrepancy knobs back to neutral.
 
-## How to use
-1. Set `.env` with your `PIXEL_ID` and `ACCESS_TOKEN` (and optionally GA4 keys).
-2. `pip install -r requirements.txt`
-3. `python app.py`
-4. In the UI under **Advanced Controls → CAPI User Data (toggles)**, set:
-   - Check the fields you want to include for CAPI.
-   - Enter an email if you want to send `em` (hashed on the server).
-   - Load the page with a `?fbclid=...` to create `_fbc`, or simply fire a PageView to create `_fbp`. The page posts values to the server automatically.
-5. Send events with the buttons or start auto stream.
+## Run locally
 
-Nothing else was removed or changed outside of the new toggles and fbp/fbc capture.
+```
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+export PIXEL_ID=YOUR_PIXEL
+export ACCESS_TOKEN=YOUR_TOKEN
+python app.py
+```
+
+or with Gunicorn:
+
+```
+gunicorn app:app -b 0.0.0.0:5000 -w 2 -k gthread --threads 4 --timeout 120
+```
+
+## Render
+
+Build Command: `pip install -r requirements.txt`  
+Start Command: `gunicorn app:app -b 0.0.0.0:$PORT -w 2 -k gthread --threads 4 --timeout 120`
+

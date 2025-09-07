@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-# E-commerce Simulator (v2.1.5): Adds CAPI user_data toggles for em, IP, UA, fbp, fbc
+# E-commerce Simulator v2.1.6
+# Changes in 2.1.6:
+# - Title: remove "Demo" → "Store Simulator"
+# - Pulsing dot indicators for Pixel Auto and Server Auto start/stop
+# - Discrepancy & Chaos: real on/off toggle that keeps header visible; inputs disabled when off
+# - Self-test buttons stay
+# - "Share event_id to CAPI" toggle: forwards pixel telemetry payload to CAPI with same event_id for dedup
+# - /chaos/reset endpoint to zero-out chaos/discrepancy knobs
 import os, json, hashlib, time, threading, uuid, math, random
 from datetime import datetime, timezone
 from collections import deque, defaultdict
@@ -30,7 +37,7 @@ except Exception:
 
 FILE_SINK_PATH  = os.getenv("FILE_SINK_PATH", "")  # e.g. "events.ndjson"
 
-APP_VERSION = "2.1.5"
+APP_VERSION = "2.1.6"
 
 app = Flask(__name__)
 
@@ -77,42 +84,36 @@ CONFIG: Dict[str, Any] = {
     "seed": "",  # when set, RNG is seeded
 
     # discrepancy toggles
-    "mismatch_value_pct": 0.0,
+    "mismatch_value_pct": 0.0,        # e.g. 0.15 -> ±15% applied to Pixel when >0
     "mismatch_currency": "NONE",      # NONE | PIXEL | CAPI
-    "desync_event_id": False,
-    "duplicate_event_id_n": 0,
-    "drop_pixel_every_n": 0,
-    "lag_capi_seconds": 0.0,
+    "desync_event_id": False,         # pixel uses a different event_id than capi
+    "duplicate_event_id_n": 0,        # 0 disables; else duplicate every Nth Pixel event_id
+    "drop_pixel_every_n": 0,          # drop every Nth Pixel event
+    "lag_capi_seconds": 0.0,          # delay before sending to CAPI (simulate network lag)
 
     # chaos
-    "net_capi_latency_ms": 0,
-    "net_capi_error_rate": 0.0,
+    "net_capi_latency_ms": 0,         # artificial latency (per request)
+    "net_capi_error_rate": 0.0,       # 0..1 force HTTP error (simulate)
     "schema_remove_contents": False,
     "schema_empty_arrays": False,
-    "schema_str_numbers": False,
+    "schema_str_numbers": False,      # send numbers as strings
     "schema_unknown_fields": False,
-    "clock_skew_seconds": 0,
-    "kill_event_types": {
+    "clock_skew_seconds": 0,          # ± seconds added to event_time
+    "kill_event_types": {             # master kill per type
         "PageView": False, "ViewContent": False, "AddToCart": False,
         "InitiateCheckout": False, "Purchase": False, "ReturnInitiated": False
     },
+    "chaos_enabled": True,            # NEW: gate(all chaos inputs). UI keeps toggle visible.
 
     # sinks
     "enable_webhook": False,
     "enable_ga4": False,
 
-    # NEW: user_data toggles and values (for CAPI only)
-    "send_em": False,
-    "send_client_ip": True,
-    "send_client_ua": True,
-    "send_fbp": True,
-    "send_fbc": True,
-    "user_email": "",
-    "fbp": "",
-    "fbc": "",
-
     # presets name (display only)
-    "active_preset": "Default"
+    "active_preset": "Default",
+
+    # NEW: share pixel event_id to CAPI (forward telemetry payload)
+    "share_event_id_to_capi": False,
 }
 
 # seeded RNG
@@ -159,7 +160,7 @@ def _ndjson_append(row: Dict[str,Any]):
         return
     try:
         with open(FILE_SINK_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\\n")
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
     except Exception:
         pass
 
@@ -264,6 +265,8 @@ def append_margin_pltv(custom_data, cfg, single_price=None, contents=None):
 def _apply_currency_override(cur, cfg, channel="capi"):
     ov = (cfg.get("currency_override") or "AUTO").upper()
     mm = (cfg.get("mismatch_currency") or "NONE").upper()
+    if not cfg.get("chaos_enabled"):
+        mm = "NONE"
     if mm == "PIXEL" and channel == "pixel":
         return None if cur else "USD"
     if mm == "CAPI" and channel == "capi":
@@ -275,7 +278,7 @@ def _apply_currency_override(cur, cfg, channel="capi"):
     return cur
 
 def _maybe_str_nums(obj, cfg):
-    if not cfg.get("schema_str_numbers"): return obj
+    if not (cfg.get("schema_str_numbers") and cfg.get("chaos_enabled")): return obj
     def t(v):
         if isinstance(v, (int, float)): return str(v)
         if isinstance(v, list): return [t(x) for x in v]
@@ -286,17 +289,18 @@ def _maybe_str_nums(obj, cfg):
 def _schema_mutations(custom_data, cfg):
     if not custom_data: return custom_data
     cd = dict(custom_data)
-    if cfg.get("schema_remove_contents"):
-        cd.pop("contents", None)
-    if cfg.get("schema_empty_arrays"):
-        if "contents" in cd: cd["contents"] = []
-        if "content_ids" in cd: cd["content_ids"] = []
-    if cfg.get("schema_unknown_fields"):
-        cd["unknown_field_xyz"] = "foo"
+    if cfg.get("chaos_enabled"):
+        if cfg.get("schema_remove_contents"):
+            cd.pop("contents", None)
+        if cfg.get("schema_empty_arrays"):
+            if "contents" in cd: cd["contents"] = []
+            if "content_ids" in cd: cd["content_ids"] = []
+        if cfg.get("schema_unknown_fields"):
+            cd["unknown_field_xyz"] = "foo"
     return cd
 
 def _apply_clock_skew(ts_unix, cfg):
-    skew = int(cfg.get("clock_skew_seconds", 0))
+    skew = int(cfg.get("clock_skew_seconds", 0) if cfg.get("chaos_enabled") else 0)
     return int(ts_unix + skew)
 
 # -------------------- Posting sinks --------------------
@@ -306,9 +310,9 @@ def capi_post(server_events, cfg):
     if not CAPI_URL or not ACCESS_TOKEN:
         return {"skipped": True, "reason": "missing_capi_config"}
 
-    lat = int(cfg.get("net_capi_latency_ms", 0))
+    lat = int(cfg.get("net_capi_latency_ms", 0) if cfg.get("chaos_enabled") else 0)
     if lat > 0: time.sleep(lat/1000.0)
-    if rand_uniform(0.0, 1.0) < float(cfg.get("net_capi_error_rate", 0.0)):
+    if cfg.get("chaos_enabled") and rand_uniform(0.0, 1.0) < float(cfg.get("net_capi_error_rate", 0.0)):
         class Dummy: status_code=503; text="Simulated upstream error"
         raise requests.HTTPError("503 Simulated", response=Dummy())
 
@@ -385,30 +389,17 @@ def contents_subtotal(contents):
         except Exception: pass
     return round(s,2)
 
-def _compose_user_data(cfg):
-    ud = {
-        "external_id": sha256_norm(cfg.get("seed","") or "anon"),  # stable anon id
-    }
-    # client ip / ua
-    if cfg.get("send_client_ip"):
-        ud["client_ip_address"] = request.remote_addr if has_request_context() else "127.0.0.1"
-    if cfg.get("send_client_ua"):
-        ud["client_user_agent"] = (request.headers.get("User-Agent","AutoRunner/1.0") if has_request_context()
-                                   else "AutoRunner/1.0")
-    # hashed email
-    if cfg.get("send_em"):
-        em_raw = (cfg.get("user_email") or "").strip().lower()
-        if em_raw:
-            ud["em"] = [sha256_norm(em_raw)]
-    # browser ids
-    if cfg.get("send_fbp") and (cfg.get("fbp") or "").strip():
-        ud["fbp"] = cfg.get("fbp").strip()
-    if cfg.get("send_fbc") and (cfg.get("fbc") or "").strip():
-        ud["fbc"] = cfg.get("fbc").strip()
+def _collect_user_data_for_capi(cfg):
+    # Minimal user_data: include IP/UA (available) for matchability
+    ip = request.remote_addr if has_request_context() else "127.0.0.1"
+    ua = (request.headers.get("User-Agent","AutoRunner/1.0") if has_request_context()
+                  else "AutoRunner/1.0")
+    ud = {"client_ip_address": ip, "client_user_agent": ua}
     return ud
 
 def map_sim_event_to_capi(e, cfg):
     et   = e.get("event_type")
+    sess = e.get("user", {})
     ctx  = e.get("context", {})
 
     cur = ctx.get("currency","USD")
@@ -423,12 +414,20 @@ def map_sim_event_to_capi(e, cfg):
         page = "/checkout"
     event_source_url = BASE_URL.rstrip("/") + page
 
+    client_ip = request.remote_addr if has_request_context() else "127.0.0.1"
+    user_agent = (request.headers.get("User-Agent","AutoRunner/1.0") if has_request_context()
+                  else "AutoRunner/1.0")
+
     base = {
         "event_time": ts_unix,
         "event_id": e.get("event_id"),
         "action_source": "website",
         "event_source_url": event_source_url,
-        "user_data": _compose_user_data(cfg)
+        "user_data": {
+            "external_id": sha256_norm(sess.get("user_id","")),
+            "client_ip_address": client_ip,
+            "client_user_agent": user_agent
+        }
     }
 
     out = []
@@ -486,14 +485,14 @@ def map_sim_event_to_capi(e, cfg):
         cd = _schema_mutations(cd, cfg)
         out = [{**base, "event_name":"ReturnInitiated", "custom_data": cd}]
 
-    # apply bad-data toggles
+    # apply bad-data toggles (only if chaos_enabled)
     for ev in out:
-        if cfg.get("null_event_id"):
+        if cfg.get("chaos_enabled") and cfg.get("null_event_id"):
             ev["event_id"] = None
         cd = ev.get("custom_data") or {}
-        if cfg.get("null_currency") and "currency" in cd:
+        if cfg.get("chaos_enabled") and cfg.get("null_currency") and "currency" in cd:
             cd["currency"] = None
-        if cfg.get("null_price"):
+        if cfg.get("chaos_enabled") and cfg.get("null_price"):
             if "value" in cd:
                 cd["value"] = None
             if "contents" in cd and isinstance(cd["contents"], list):
@@ -531,12 +530,12 @@ def banner_html():
         banners.append("CAPI not fully configured: set PIXEL_ID and ACCESS_TOKEN to enable server sends.")
     if CONFIG.get("enable_ga4") and not (GA4_MEASUREMENT_ID and GA4_API_SECRET):
         banners.append("GA4 enabled but GA4 credentials missing.")
-    return "".join(f'<div class="banner">{{msg}}</div>' for msg in banners)
+    return "".join(f'<div class="banner">{msg}</div>' for msg in banners)
 
 PAGE_HTML_HEAD = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Demo Store — Simulator</title>
+<title>Store Simulator</title>
 <style>
 :root { --bd:#223040; --fg:#e6eef7; --muted:#9fb3c8; --ok:#28c76f; --err:#ff5c5c; --bg:#0b0f14; --panel:#0e1520; }
 * { box-sizing:border-box }
@@ -565,6 +564,17 @@ pre { margin:0; white-space:pre-wrap; word-break:break-word; }
 code { color:#cbd9ff; }
 .warn { color:#ffcf6e }
 .flex { display:flex; gap:10px; }
+
+/* Pulser */
+.pulse-dot{ width:10px; height:10px; border-radius:999px; background:#7ad47a; box-shadow:0 0 0 0 rgba(122,212,122,0.7); animation:pulse 2s infinite; display:inline-block; vertical-align:middle; }
+.pulse-dot.off{ background:#777; box-shadow:none; animation:none; }
+@keyframes pulse{ 0%{ box-shadow:0 0 0 0 rgba(122,212,122,0.7);} 70%{ box-shadow:0 0 0 10px rgba(122,212,122,0);} 100%{ box-shadow:0 0 0 0 rgba(122,212,122,0);} }
+
+/* Toggle */
+.toggle { position:relative; width:46px; height:24px; background:#223; border-radius:999px; border:1px solid #2f4155; cursor:pointer; }
+.toggle input{ display:none; }
+.toggle .knob{ position:absolute; top:2px; left:2px; width:20px; height:20px; border-radius:999px; background:#999; transition:all .18s; }
+.toggle input:checked + .knob{ left:24px; background:#28c76f; }
 </style>
 <script>
 function rid(){ return 'evt_' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
@@ -572,13 +582,14 @@ function flashIcon(btn, ok){ if(!btn) return; const cls = ok ? 'show-tick' : 'sh
 async function fetchJSON(url, opts){ const r = await fetch(url, opts); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); }
 async function fetchOK(url, opts){ try{ const r = await fetch(url, opts); return r.ok; }catch(e){ return false; } }
 function copyTxt(t){ navigator.clipboard.writeText(t).catch(()=>{}); }
+function setDot(id, on){ const el = document.getElementById(id); if(!el) return; if(on){ el.classList.remove('off'); } else { el.classList.add('off'); } }
 </script>
 """
 
 PAGE_HTML_BODY_PREFIX = """
 </head><body>
 <div class="container">
-  <h1>Demo Store Simulator <span class="small">v__APP_VERSION__</span></h1>
+  <h1>Store Simulator <span class="small">v__APP_VERSION__</span></h1>
   __BANNERS__
   <div class="topbar">
     <span class="badge" id="badge_pixel">Pixel: ?</span>
@@ -591,8 +602,8 @@ PAGE_HTML_BODY_PREFIX = """
 
   <div class="grid">
     <div class="card">
-      <h3>Pixel Test</h3>
-      <p class="small">Sends browser events only if <b>Enable Pixel</b> is on. We also ping the server for telemetry to power the dedup meter.</p>
+      <h3>Pixel Self‑Test</h3>
+      <p class="small">Quickly fire Pixel events for sanity checks. These also post telemetry to the server for dedup/diff.</p>
       <div class="row" style="gap:10px; margin-bottom:6px;">
         <button class="btn" onclick="sendView(this)">ViewContent
           <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
@@ -616,15 +627,19 @@ PAGE_HTML_BODY_PREFIX = """
         <span class="small">Next Event Preview:</span>
         <pre id="previewBox" style="width:100%; background:#0b1320; border:1px solid var(--bd); border-radius:10px; padding:8px; margin-top:6px; height:120px; overflow:auto;">{}</pre>
       </div>
+      <div class="row small">
+        <label><input id="share_event_id_to_capi" type="checkbox"> Share event_id to CAPI (for dedup)</label>
+      </div>
     </div>
 
-    <!-- NEW: Pixel Auto (browser-side) -->
+    <!-- Pixel Auto (browser-side) -->
     <div class="card">
       <h3>Pixel Auto (browser → Pixel)</h3>
       <p class="small">Automatically fires Meta Pixel events from the browser. Respects Enable Pixel, currency/price nulls, mismatch, and event-ID toggles.</p>
       <div class="row">
         <label>Events/sec</label>
         <input id="px_rps" type="number" step="0.1" min="0.1" value="0.5"/>
+        <span class="small">Status</span><span id="px_dot" class="pulse-dot off" aria-label="pixel auto status"></span>
       </div>
       <div class="row">
         <button id="pxStartBtn" class="btn" onclick="pixelAutoStart(this)">
@@ -634,7 +649,8 @@ PAGE_HTML_BODY_PREFIX = """
         </button>
         <button id="pxStopBtn" class="btn" onclick="pixelAutoStop(this)" disabled>
           Stop
-          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
+          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
+          <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
         </button>
       </div>
       <p id="px_status" class="small">Stopped</p>
@@ -645,6 +661,7 @@ PAGE_HTML_BODY_PREFIX = """
       <p class="small">Streams sessions to CAPI (and optional sinks). If <b>Enable CAPI</b> is off, nothing is sent.</p>
       <div class="row">
         <label>Sessions/sec</label><input id="rps" type="number" step="0.1" min="0.1" value="0.5"/>
+        <span class="small">Status</span><span id="svr_dot" class="pulse-dot off" aria-label="server auto status"></span>
       </div>
       <div class="row">
         <button id="startBtn" class="btn" onclick="startAuto(this)">Start
@@ -652,7 +669,8 @@ PAGE_HTML_BODY_PREFIX = """
           <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
         </button>
         <button id="stopBtn" class="btn" onclick="stopAuto(this)">Stop
-          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
+          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
+          <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
         </button>
       </div>
       <p id="status" class="small">…</p>
@@ -713,21 +731,17 @@ PAGE_HTML_BODY_PREFIX = """
       <div class="row"><label>Append PLTV</label><input id="append_pltv" type="checkbox" checked/></div>
       <div class="row"><label>PLTV min</label><input id="pltv_min" type="number" step="0.01" min="0" value="120"/></div>
       <div class="row"><label>PLTV max</label><input id="pltv_max" type="number" step="0.01" min="0" value="600"/></div>
-
       <hr/>
-      <h3 style="margin-top:8px;">CAPI User Data (toggles)</h3>
-      <div class="row"><label class="small">Send Hashed Email (em)</label><input id="send_em" type="checkbox"/></div>
-      <div class="row"><label class="small">User Email (for hashing)</label><input id="user_email" style="width:260px" placeholder="user@example.com"/></div>
-      <div class="row"><label class="small">Send Client IP</label><input id="send_client_ip" type="checkbox"/></div>
-      <div class="row"><label class="small">Send User Agent</label><input id="send_client_ua" type="checkbox"/></div>
-      <div class="row"><label class="small">Send fbp</label><input id="send_fbp" type="checkbox"/></div>
-      <div class="row"><label class="small">Send fbc</label><input id="send_fbc" type="checkbox"/></div>
-      <div class="row"><label class="small">Detected fbp:</label><span id="fbp_val" class="small">…</span></div>
-      <div class="row"><label class="small">Detected fbc:</label><span id="fbc_val" class="small">…</span></div>
+      <div class="row"><label><input id="share_event_id_to_capi_cfg" type="checkbox"/> Share event_id to CAPI</label></div>
     </div>
 
     <div class="card">
       <h3>Discrepancy & Chaos</h3>
+      <div class="row">
+        <label class="small" style="margin-right:6px;">Enable</label>
+        <label class="toggle"><input type="checkbox" id="chaos_enabled"><span class="knob"></span></label>
+        <button class="btn" onclick="resetChaos(this)">Reset Chaos</button>
+      </div>
       <div class="row"><label>Mismatch value ±%</label><input id="mismatch_value_pct" type="number" step="0.01" min="0" max="1" value="0"/></div>
       <div class="row"><label>Mismatch currency</label>
         <select id="mismatch_currency"><option>NONE</option><option>PIXEL</option><option>CAPI</option></select>
@@ -776,8 +790,9 @@ PAGE_HTML_BODY_PREFIX = """
 
     <div class="card" style="grid-column:1/-1;">
       <h3>Scenario Runner (JSON)</h3>
-      <p class="small">Paste a simple JSON scenario (steps with event types and waits).</p>
-      <textarea id="scenario_text" placeholder='{"name":"demo","steps":[{"page_view":{}},{"product_view":{}},{"add_to_cart":{"qty":1}},{"begin_checkout":{}},{"purchase":{}}]}'></textarea>
+      <p class="small">Paste a simple JSON scenario (steps with event types and waits). Example:
+      <code>{{"name":"cart_abandon","steps":[{{"page_view":{{"url":"/"}}}},{{"product_view":{{"sku":"SKU-10123"}}}},{{"add_to_cart":{{"qty":1}}}},{{"wait":12}},{{"begin_checkout":{{}}}}]}}</code></p>
+      <textarea id="scenario_text" placeholder='{{"name":"demo","steps":[{{"page_view":{{}}}},{{"product_view":{{}}}},{{"add_to_cart":{{"qty":1}}}},{{"begin_checkout":{{}}}},{{"purchase":{{}}}}]}}'></textarea>
       <div class="row"><button class="btn" onclick="runScenario(this)">Run Scenario</button></div>
       <p id="scenario_status" class="small">…</p>
     </div>
@@ -837,7 +852,8 @@ function currentCurrency(channel){
   const mode = (document.getElementById('currency_override').value || 'AUTO').toUpperCase();
   const bad = readBadToggles();
   const mm = (document.getElementById('mismatch_currency').value||'NONE').toUpperCase();
-  if (mm==='PIXEL' && channel==='pixel') return null;
+  const chaos = document.getElementById('chaos_enabled').checked;
+  if (chaos && mm==='PIXEL' && channel==='pixel') return null;
   if (mode==='NULL') return null;
   if (bad.null_currency) return null;
   if (mode!=='AUTO') return mode;
@@ -854,58 +870,30 @@ function updatePreview(){
 
 // ----- Discrepancy helpers -----
 function maybeMismatchValue(val){
-  const pct = parseFloat(document.getElementById('mismatch_value_pct').value||'0');
+  const chaos = document.getElementById('chaos_enabled').checked;
+  const pct = chaos ? parseFloat(document.getElementById('mismatch_value_pct').value||'0') : 0;
   if (!pct || !val) return val;
   const delta = val * pct;
   return Math.round((val + randBetween(-delta, delta))*100)/100;
 }
 function maybeDesyncEventId(eid){
-  return document.getElementById('desync_event_id').checked ? eid + '_px' : eid;
+  return document.getElementById('chaos_enabled').checked && document.getElementById('desync_event_id').checked ? eid + '_px' : eid;
 }
 function maybeDropPixel(){
+  if (!document.getElementById('chaos_enabled').checked) return false;
   const n = parseInt(document.getElementById('drop_pixel_every_n').value||'0',10);
   if (!n) return false;
   window.__pxCount = (window.__pxCount||0) + 1;
   return window.__pxCount % n === 0;
 }
 function maybeDupePixelId(eid){
+  if (!document.getElementById('chaos_enabled').checked) return eid;
   const n = parseInt(document.getElementById('duplicate_event_id_n').value||'0',10);
   if (!n) return eid;
   window.__dupeIdx = (window.__dupeIdx||0) + 1;
   if (window.__dupeIdx % n === 0) return (window.__lastPxEid || eid);
   window.__lastPxEid = eid;
   return eid;
-}
-
-// ----- fbp/fbc detection & post -----
-function getCookie(name){
-  const m = document.cookie.match(new RegExp('(?:^|; )' + name.replace(/([.$?*|{}()\\[\\]\\\\\\/\\+^])/g, '\\\\$1') + '=([^;]*)'));
-  return m ? decodeURIComponent(m[1]) : '';
-}
-function setCookie(name, value, days){
-  const d = new Date();
-  d.setTime(d.getTime() + (days*24*60*60*1000));
-  document.cookie = name + '=' + encodeURIComponent(value) + '; path=/; expires=' + d.toUTCString();
-}
-function getParam(name){
-  const u = new URL(window.location.href);
-  return u.searchParams.get(name) || '';
-}
-async function detectFbpFbc(){
-  // build _fbc from fbclid if present
-  const fbclid = getParam('fbclid');
-  if (fbclid){
-    const ts = Math.floor(Date.now()/1000);
-    const fbc = 'fb.1.' + ts + '.' + fbclid;
-    setCookie('_fbc', fbc, 180);
-  }
-  const fbp = getCookie('_fbp') || '';
-  const fbc = getCookie('_fbc') || '';
-  document.getElementById('fbp_val').textContent = fbp || '(none)';
-  document.getElementById('fbc_val').textContent = fbc || '(none)';
-  try{
-    await fetch('/client/fbids', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({fbp, fbc})});
-  }catch(e){}
 }
 
 // ----- Pixel send & server telemetry -----
@@ -916,12 +904,17 @@ async function sendPixel(name, payload, opts, btn){
   if ('value' in payload) payload.value = maybeMismatchValue(payload.value);
   const eid0 = (opts && opts.eventID) || rid();
   const eid = maybeDupePixelId(maybeDesyncEventId(eid0));
-  if (maybeDropPixel()) {
+  const dropped = maybeDropPixel();
+  if (dropped) {
     await fetch('/metrics/pixel', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({event_name:name,intended, sent:payload, event_id:eid, dropped:true})}).catch(()=>{});
     flashIcon(btn, true); return;
   }
   try { fbq('track', name, payload, { eventID: eid }); } catch(e) {}
   await fetch('/metrics/pixel', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({event_name:name,intended, sent:payload, event_id:eid})}).catch(()=>{});
+  // If user asked to share to CAPI, the server will forward using this same event_id
+  if (document.getElementById('share_event_id_to_capi').checked) {
+    try { await fetch('/config/share_eid', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({share:true})}); } catch(e) {}
+  }
   flashIcon(btn, true);
 }
 
@@ -993,6 +986,7 @@ function pixelAutoStart(btn){
   document.getElementById('px_status').textContent = 'Running at ' + (Math.round((1000/interval)*100)/100) + ' events/sec';
   document.getElementById('pxStartBtn').disabled = true;
   document.getElementById('pxStopBtn').disabled = false;
+  setDot('px_dot', true);
   flashIcon(btn, true);
 }
 
@@ -1002,6 +996,7 @@ function pixelAutoStop(btn){
   document.getElementById('px_status').textContent = 'Stopped';
   document.getElementById('pxStartBtn').disabled = false;
   document.getElementById('pxStopBtn').disabled = true;
+  setDot('px_dot', false);
   flashIcon(btn, true);
 }
 
@@ -1010,6 +1005,7 @@ function pxRefreshStatus(){
   document.getElementById('px_status').textContent = running ? 'Running' : 'Stopped';
   document.getElementById('pxStartBtn').disabled = running;
   document.getElementById('pxStopBtn').disabled = !running;
+  setDot('px_dot', running);
 }
 
 // ----- Auto stream controls (server) -----
@@ -1020,6 +1016,7 @@ async function refreshStatus(){
     document.getElementById('startBtn').disabled = j.running;
     document.getElementById('stopBtn').disabled = !j.running;
     if (j.running) document.getElementById('rps').value = j.rps;
+    setDot('svr_dot', j.running);
   } catch(e){ document.getElementById('status').textContent = 'Unknown'; }
 }
 async function startAuto(btn){
@@ -1063,6 +1060,23 @@ async function resetDefaults(btn){
   const ok = await fetchOK('/presets/reset', {method:'POST'});
   flashIcon(btn, ok); await loadConfig();
 }
+
+// ----- Chaos panel enable/disable -----
+function chaosApplyDisabled(){
+  const en = document.getElementById('chaos_enabled').checked;
+  const card = document.querySelector('h3+div').parentElement; // not robust; fallback below
+  const panel = document.querySelectorAll('.card')[4]; // Discrepancy card index (rough)
+  const parent = panel || document;
+  parent.querySelectorAll('input,select,button').forEach(el => {
+    const id = el.id||'';
+    if (id==='chaos_enabled' || el.textContent?.includes('Reset Chaos')) return; // keep toggle & reset active
+    if (el.closest('h3')) return;
+    el.disabled = !en;
+  });
+}
+document.addEventListener('change', (e)=>{
+  if (e.target && e.target.id==='chaos_enabled') chaosApplyDisabled();
+});
 
 // ----- Config I/O -----
 async function loadConfig(){
@@ -1112,15 +1126,10 @@ async function loadConfig(){
   document.getElementById('kill_Purchase').checked = !!(cfg.kill_event_types||{})["Purchase"];
   document.getElementById('enable_webhook').checked = !!cfg.enable_webhook;
   document.getElementById('enable_ga4').checked = !!cfg.enable_ga4;
-
-  // NEW user_data toggles
-  document.getElementById('send_em').checked = !!cfg.send_em;
-  document.getElementById('user_email').value = cfg.user_email || '';
-  document.getElementById('send_client_ip').checked = !!cfg.send_client_ip;
-  document.getElementById('send_client_ua').checked = !!cfg.send_client_ua;
-  document.getElementById('send_fbp').checked = !!cfg.send_fbp;
-  document.getElementById('send_fbc').checked = !!cfg.send_fbc;
-
+  document.getElementById('share_event_id_to_capi').checked = !!cfg.share_event_id_to_capi;
+  document.getElementById('share_event_id_to_capi_cfg').checked = !!cfg.share_event_id_to_capi;
+  document.getElementById('chaos_enabled').checked = !!cfg.chaos_enabled;
+  chaosApplyDisabled();
   updateBadges(); updatePreview();
 }
 async function saveConfig(btn){
@@ -1169,14 +1178,8 @@ async function saveConfig(btn){
     },
     enable_webhook: document.getElementById('enable_webhook').checked,
     enable_ga4: document.getElementById('enable_ga4').checked,
-
-    // NEW user_data toggles
-    send_em: document.getElementById('send_em').checked,
-    user_email: document.getElementById('user_email').value||'',
-    send_client_ip: document.getElementById('send_client_ip').checked,
-    send_client_ua: document.getElementById('send_client_ua').checked,
-    send_fbp: document.getElementById('send_fbp').checked,
-    send_fbc: document.getElementById('send_fbc').checked,
+    chaos_enabled: document.getElementById('chaos_enabled').checked,
+    share_event_id_to_capi: document.getElementById('share_event_id_to_capi_cfg').checked,
   };
   const ok = await fetchOK('/auto/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   flashIcon(btn, ok);
@@ -1260,11 +1263,17 @@ async function downloadReplay(){
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'replay_bundle.json'; a.click();
 }
 
+// ----- Chaos Reset -----
+async function resetChaos(btn){
+  const ok = await fetchOK('/chaos/reset', {method:'POST'});
+  flashIcon(btn, ok);
+  if (ok) await loadConfig();
+}
+
 // ----- Init -----
 window.addEventListener('load', async () => {
   await loadConfig(); updatePreview(); refreshStatus(); pollMetrics(); refreshConsole();
   pxRefreshStatus(); // initialize Pixel Auto controls
-  await detectFbpFbc(); // detect & post fbp/fbc
   if (document.getElementById('enable_pixel').checked) { try { fbq('track','PageView'); } catch(e){} }
 });
 </script>
@@ -1295,7 +1304,9 @@ def home():
 # -------------------- Metrics endpoints --------------------
 @app.post("/metrics/pixel")
 def metrics_pixel():
-    """Client pings here when it fires a Pixel event so we can power dedup & diff."""
+    """Client pings here when it fires a Pixel event so we can power dedup & diff.
+       If share_event_id_to_capi is enabled, forward to CAPI with same event_id.
+    """
     try:
         body = request.get_json(force=True) or {}
     except Exception:
@@ -1313,6 +1324,35 @@ def metrics_pixel():
     }
     _log_event(entry)
     _ndjson_append({"channel":"pixel","event":entry})
+
+    # Forward to CAPI for dedup if enabled and not dropped
+    cfg = get_cfg_snapshot()
+    if (not dropped) and cfg.get("share_event_id_to_capi"):
+        try:
+            ev = {
+                "event_name": name,
+                "event_time": int(time.time()),
+                "event_id": eid,
+                "action_source": "website",
+                "event_source_url": BASE_URL,
+                "user_data": _collect_user_data_for_capi(cfg),
+                "custom_data": sent if isinstance(sent, dict) else {}
+            }
+            resp = capi_post([ev], cfg)
+            loge = {
+                "ts": now_iso(), "channel":"capi", "event_name": name,
+                "intended": {"forwarded_from":"pixel", "pixel_sent": sent},
+                "sent": ev, "response": resp, "ok": True, "event_id": eid
+            }
+            _log_event(loge)
+            _ndjson_append({"channel":"capi","event":loge})
+        except requests.HTTPError as e:
+            loge = {"ts": now_iso(), "channel":"capi", "event_name": name, "intended": {}, "sent": {}, "response":{"error":str(e)}, "ok": False, "event_id": eid}
+            _log_event(loge)
+        except Exception as e:
+            loge = {"ts": now_iso(), "channel":"capi", "event_name": name, "intended": {}, "sent": {}, "response":{"error":str(e)}, "ok": False, "event_id": eid}
+            _log_event(loge)
+
     return {"ok": True}
 
 @app.get("/metrics")
@@ -1360,6 +1400,16 @@ def set_seed():
         CONFIG["seed"] = seed
     reseed()
     return {"ok": True}
+
+@app.post("/config/share_eid")
+def set_share_eid():
+    try:
+        share = bool((request.get_json(force=True) or {}).get("share", False))
+    except Exception:
+        share = False
+    with CONFIG_LOCK:
+        CONFIG["share_event_id_to_capi"] = share
+    return {"ok": True, "share_event_id_to_capi": share}
 
 DEFAULT_CONFIG = json.loads(json.dumps(CONFIG))  # snapshot of boot defaults
 
@@ -1455,7 +1505,7 @@ def _send_one_through_sinks(sim_evt, cfg):
         if kill.get(ev.get("event_name",""), False):
             return
 
-    lag = float(cfg.get("lag_capi_seconds", 0.0))
+    lag = float(cfg.get("lag_capi_seconds", 0.0) if cfg.get("chaos_enabled") else 0.0)
     if lag > 0: time.sleep(max(0.0, lag))
 
     # Post CAPI
@@ -1592,19 +1642,25 @@ def ingest():
     except Exception as e:
         return {"ok": False, "error": str(e)}, 500
 
-# -------------------- Client fb ids (fbp/fbc) --------------------
-@app.post("/client/fbids")
-def client_fbids():
-    try:
-        body = request.get_json(force=True) or {}
-    except Exception:
-        return {"ok": False}, 400
-    fbp = (body.get("fbp") or "").strip()
-    fbc = (body.get("fbc") or "").strip()
+# -------------------- Chaos reset --------------------
+@app.post("/chaos/reset")
+def chaos_reset():
     with CONFIG_LOCK:
-        if fbp: CONFIG["fbp"] = fbp
-        if fbc: CONFIG["fbc"] = fbc
-    return {"ok": True}
+        CONFIG["mismatch_value_pct"] = 0.0
+        CONFIG["mismatch_currency"] = "NONE"
+        CONFIG["desync_event_id"] = False
+        CONFIG["duplicate_event_id_n"] = 0
+        CONFIG["drop_pixel_every_n"] = 0
+        CONFIG["lag_capi_seconds"] = 0.0
+        CONFIG["net_capi_latency_ms"] = 0
+        CONFIG["net_capi_error_rate"] = 0.0
+        CONFIG["schema_remove_contents"] = False
+        CONFIG["schema_empty_arrays"] = False
+        CONFIG["schema_str_numbers"] = False
+        CONFIG["schema_unknown_fields"] = False
+        CONFIG["clock_skew_seconds"] = 0
+        # keep chaos_enabled as-is (toggle stays clickable)
+    return {"ok": True, "config": get_cfg_snapshot()}
 
 # -------------------- Config endpoints --------------------
 @app.route("/auto/config", methods=["GET", "POST"])
@@ -1620,8 +1676,7 @@ def auto_config():
 
     with CONFIG_LOCK:
         # master
-        for k in ("enable_pixel","enable_capi","enable_webhook","enable_ga4","append_margin","append_pltv","null_price","null_currency","null_event_id","desync_event_id","schema_remove_contents","schema_empty_arrays","schema_str_numbers","schema_unknown_fields",
-                  "send_em","send_client_ip","send_client_ua","send_fbp","send_fbc"):
+        for k in ("enable_pixel","enable_capi","enable_webhook","enable_ga4","append_margin","append_pltv","null_price","null_currency","null_event_id","desync_event_id","schema_remove_contents","schema_empty_arrays","schema_str_numbers","schema_unknown_fields","chaos_enabled","share_event_id_to_capi"):
             if k in body: CONFIG[k] = to_bool(body[k], CONFIG.get(k,False))
         # traffic
         if "rps" in body: CONFIG["rps"] = clampf(body["rps"], 0.1, 10.0, CONFIG["rps"])
@@ -1673,12 +1728,6 @@ def auto_config():
                 keep[name] = to_bool(d.get(name, CONFIG["kill_event_types"].get(name, False)))
             CONFIG["kill_event_types"] = keep
 
-        # NEW: values
-        if "user_email" in body: CONFIG["user_email"] = str(body["user_email"] or "")
-        # fbp/fbc are primarily set via /client/fbids; allow override if present
-        if "fbp" in body: CONFIG["fbp"] = str(body["fbp"] or "")
-        if "fbc" in body: CONFIG["fbc"] = str(body["fbc"] or "")
-
     return jsonify({"ok": True, "config": get_cfg_snapshot()})
 
 # -------------------- Scenario runner --------------------
@@ -1690,7 +1739,7 @@ def _scenario_loop(steps: List[Dict[str,Any]]):
     for step in steps:
         if "wait" in step:
             try:
-                time.sleep(max(0.0, float(step["wait"])))
+                time.sleep(max(0.0, float(step["wait"])));
             except Exception:
                 pass
             continue
