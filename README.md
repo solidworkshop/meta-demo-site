@@ -1,25 +1,22 @@
-# E-commerce Simulator — Full Build (.env + Gunicorn-ready)
+# E-commerce Simulator v2.1.3
 
-## Quickstart (local)
-```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env && nano .env   # set PIXEL_ID, ACCESS_TOKEN, etc.
-python app.py
+## Setup
+1. Create a `.env` file next to `app.py` (Render: Dashboard → Environment):
 ```
-
-## Deploy (Render or similar)
-- **Start Command (simple):**
-  ```bash
-  python app.py
-  ```
-- **Start Command (gunicorn):**
-  ```bash
-  gunicorn -w 4 -b 0.0.0.0:5000 app:app
-  ```
-- **Env Vars:** set `PIXEL_ID`, `ACCESS_TOKEN`, `TEST_EVENT_CODE` (optional), `GRAPH_VER`, `BASE_URL`, `DEFAULT_CATALOG_SIZE`.
+PIXEL_ID=your_pixel_id
+ACCESS_TOKEN=your_capi_token
+TEST_EVENT_CODE=optional_test_id
+BASE_URL=https://your-domain
+GRAPH_VER=v20.0
+FILE_SINK_PATH=events.ndjson
+GA4_MEASUREMENT_ID=
+GA4_API_SECRET=
+WEBHOOK_URL=
+WEBHOOK_HEADERS={}
+```
+2. Install deps: `pip install -r requirements.txt`
+3. Run locally: `python app.py`  (or `gunicorn app:app` in prod)
 
 ## Notes
-- If `PIXEL_ID`/`ACCESS_TOKEN` not set, CAPI calls are simulated and marked in the response.
-- Catalog size uses app state: `STATE["default_catalog_size"]` (no global mutation).
-- Buttons flash green on success; red border persists on error.
+- Discrepancy & Chaos has a master toggle. OFF disables the UI and all chaos effects at runtime.
+- Self Test button hits `/selftest/run` and attempts a tiny CAPI event (uses TEST_EVENT_CODE if set).

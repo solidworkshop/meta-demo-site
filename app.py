@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-# E-commerce Simulator: Pixel buttons, /ingest forwarder, server auto streamer,
-# Presets + seed, diff viewer, dedup meter, discrepancy & chaos toggles,
-# Margin (price - random cost) + PLTV values, currency control, file + webhook + GA4 sinks,
-# Event console, scenario runner, clock skew, health/version.
+# E-commerce Simulator v2.1.3
+# Changes in 2.1.3:
+# - Remove "Demo" from page title
+# - Pulsing dot indicator on Pixel Auto + Server Auto when running
+# - Advanced Controls always visible (no "Visible" checkbox)
+# - Discrepancy & Chaos: real ON/OFF toggle disables UI and runtime effects
+# - Self Test card & /selftest/run endpoint restored
 import os, json, hashlib, time, threading, uuid, math, random
 from datetime import datetime, timezone
 from collections import deque, defaultdict
@@ -33,7 +36,7 @@ except Exception:
 
 FILE_SINK_PATH  = os.getenv("FILE_SINK_PATH", "")  # e.g. "events.ndjson"
 
-APP_VERSION = "2.1.2"
+APP_VERSION = "2.1.3"
 
 app = Flask(__name__)
 
@@ -80,22 +83,23 @@ CONFIG: Dict[str, Any] = {
     "seed": "",  # when set, RNG is seeded
 
     # discrepancy toggles
-    "mismatch_value_pct": 0.0,        # e.g. 0.15 -> ±15% applied to Pixel when >0
-    "mismatch_currency": "NONE",      # NONE | PIXEL | CAPI
-    "desync_event_id": False,         # pixel uses a different event_id than capi
-    "duplicate_event_id_n": 0,        # 0 disables; else duplicate every Nth Pixel event_id
-    "drop_pixel_every_n": 0,          # drop every Nth Pixel event
-    "lag_capi_seconds": 0.0,          # delay before sending to CAPI (simulate network lag)
+    "chaos_enabled": True,           # NEW: master on/off for this panel
+    "mismatch_value_pct": 0.0,       # ±% applied to Pixel when >0
+    "mismatch_currency": "NONE",     # NONE | PIXEL | CAPI
+    "desync_event_id": False,        # pixel uses a different event_id than capi
+    "duplicate_event_id_n": 0,       # 0 disables; else duplicate every Nth Pixel event_id
+    "drop_pixel_every_n": 0,         # drop every Nth Pixel event
+    "lag_capi_seconds": 0.0,         # delay before sending to CAPI
 
     # chaos
-    "net_capi_latency_ms": 0,         # artificial latency (per request)
-    "net_capi_error_rate": 0.0,       # 0..1 force HTTP error (simulate)
+    "net_capi_latency_ms": 0,        # artificial latency (per request)
+    "net_capi_error_rate": 0.0,      # 0..1 force HTTP error (simulate)
     "schema_remove_contents": False,
     "schema_empty_arrays": False,
-    "schema_str_numbers": False,      # send numbers as strings
+    "schema_str_numbers": False,     # send numbers as strings
     "schema_unknown_fields": False,
-    "clock_skew_seconds": 0,          # ± seconds added to event_time
-    "kill_event_types": {             # master kill per type
+    "clock_skew_seconds": 0,         # ± seconds added to event_time
+    "kill_event_types": {            # master kill per type
         "PageView": False, "ViewContent": False, "AddToCart": False,
         "InitiateCheckout": False, "Purchase": False, "ReturnInitiated": False
     },
@@ -152,7 +156,7 @@ def _ndjson_append(row: Dict[str,Any]):
         return
     try:
         with open(FILE_SINK_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+            f.write(json.dumps(row, ensure_ascii=False) + "\\n")
     except Exception:
         pass
 
@@ -253,10 +257,18 @@ def append_margin_pltv(custom_data, cfg, single_price=None, contents=None):
         custom_data["predicted_ltv"] = round(rand_uniform(lo, hi), 2)
     return custom_data
 
+# -------------------- Chaos helpers (server-side switches) --------------------
+def chaos(cfg, key, default_if_off):
+    """Return cfg[key] if chaos enabled, else default neutral value."""
+    if cfg.get("chaos_enabled", True):
+        return cfg.get(key)
+    return default_if_off
+
 # -------------------- Mapping sim → CAPI/GA4 helpers --------------------
 def _apply_currency_override(cur, cfg, channel="capi"):
     ov = (cfg.get("currency_override") or "AUTO").upper()
-    mm = (cfg.get("mismatch_currency") or "NONE").upper()
+    mm_all = (cfg.get("mismatch_currency") or "NONE").upper()
+    mm = mm_all if cfg.get("chaos_enabled", True) else "NONE"
     if mm == "PIXEL" and channel == "pixel":
         return None if cur else "USD"
     if mm == "CAPI" and channel == "capi":
@@ -268,7 +280,7 @@ def _apply_currency_override(cur, cfg, channel="capi"):
     return cur
 
 def _maybe_str_nums(obj, cfg):
-    if not cfg.get("schema_str_numbers"): return obj
+    if not (cfg.get("chaos_enabled", True) and cfg.get("schema_str_numbers")): return obj
     def t(v):
         if isinstance(v, (int, float)): return str(v)
         if isinstance(v, list): return [t(x) for x in v]
@@ -279,17 +291,17 @@ def _maybe_str_nums(obj, cfg):
 def _schema_mutations(custom_data, cfg):
     if not custom_data: return custom_data
     cd = dict(custom_data)
-    if cfg.get("schema_remove_contents"):
+    if cfg.get("chaos_enabled", True) and cfg.get("schema_remove_contents"):
         cd.pop("contents", None)
-    if cfg.get("schema_empty_arrays"):
+    if cfg.get("chaos_enabled", True) and cfg.get("schema_empty_arrays"):
         if "contents" in cd: cd["contents"] = []
         if "content_ids" in cd: cd["content_ids"] = []
-    if cfg.get("schema_unknown_fields"):
+    if cfg.get("chaos_enabled", True) and cfg.get("schema_unknown_fields"):
         cd["unknown_field_xyz"] = "foo"
     return cd
 
 def _apply_clock_skew(ts_unix, cfg):
-    skew = int(cfg.get("clock_skew_seconds", 0))
+    skew = int(chaos(cfg, "clock_skew_seconds", 0) or 0)
     return int(ts_unix + skew)
 
 # -------------------- Posting sinks --------------------
@@ -299,9 +311,10 @@ def capi_post(server_events, cfg):
     if not CAPI_URL or not ACCESS_TOKEN:
         return {"skipped": True, "reason": "missing_capi_config"}
 
-    lat = int(cfg.get("net_capi_latency_ms", 0))
+    lat = int(chaos(cfg, "net_capi_latency_ms", 0) or 0)
     if lat > 0: time.sleep(lat/1000.0)
-    if rand_uniform(0.0, 1.0) < float(cfg.get("net_capi_error_rate", 0.0)):
+    err_rate = float(chaos(cfg, "net_capi_error_rate", 0.0) or 0.0)
+    if rand_uniform(0.0, 1.0) < err_rate:
         class Dummy: status_code=503; text="Simulated upstream error"
         raise requests.HTTPError("503 Simulated", response=Dummy())
 
@@ -466,7 +479,7 @@ def map_sim_event_to_capi(e, cfg):
         cd = _schema_mutations(cd, cfg)
         out = [{**base, "event_name":"ReturnInitiated", "custom_data": cd}]
 
-    # apply bad-data toggles
+    # apply bad-data toggles (not gated by chaos; these are explicit)
     for ev in out:
         if cfg.get("null_event_id"):
             ev["event_id"] = None
@@ -516,7 +529,7 @@ def banner_html():
 PAGE_HTML_HEAD = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Demo Store — Simulator</title>
+<title>Store Simulator</title>
 <style>
 :root { --bd:#223040; --fg:#e6eef7; --muted:#9fb3c8; --ok:#28c76f; --err:#ff5c5c; --bg:#0b0f14; --panel:#0e1520; }
 * { box-sizing:border-box }
@@ -536,8 +549,7 @@ textarea { width:100%; min-height:90px; }
 .btn .tick, .btn .x { position:absolute; right:8px; top:50%; transform:translateY(-50%) scale(0.8); opacity:0; transition:opacity .18s, transform .18s; }
 .btn .tick { color:var(--ok); } .btn .x { color:var(--err); }
 .btn .tick svg, .btn .x svg { width:18px; height:18px; }
-.btn.show-tick .tick { opacity:1; transform:translateY(-50%) scale(1); }
-.btn.show-err .x { opacity:1; transform:translateY(-50%) scale(1); }
+.btn[disabled] { opacity:0.7; cursor:not-allowed; }
 .table { width:100%; border-collapse:collapse; font-size:12px; }
 .table th, .table td { border-bottom:1px solid #183048; padding:6px 8px; vertical-align:top; }
 .badge { display:inline-block; border:1px solid var(--bd); padding:2px 8px; border-radius:999px; font-size:11px; color:var(--muted); }
@@ -547,11 +559,26 @@ pre { margin:0; white-space:pre-wrap; word-break:break-word; }
 code { color:#cbd9ff; }
 .warn { color:#ffcf6e }
 .flex { display:flex; gap:10px; }
-.modal{ position:fixed; inset:0; background:rgba(0,0,0,0.6); display:none; align-items:center; justify-content:center; }
-.modal .panel{ background:#0e1520; border:1px solid var(--bd); border-radius:12px; max-width:760px; width:92vw; max-height:80vh; padding:12px; overflow:auto; }
-.modal .panel h4{ margin:0 0 6px; }
-.modal .close{ float:right; cursor:pointer; }
-.hidden{ display:none !important; }
+
+/* Pulsing status dot */
+.dot { width:10px; height:10px; border-radius:50%; background:var(--ok); box-shadow:0 0 0 0 rgba(40,199,111,0.5); animation:pulse 1.5s infinite; display:inline-block; }
+.dot.hidden { display:none; }
+@keyframes pulse {
+  0% { box-shadow:0 0 0 0 rgba(40,199,111,0.6); }
+  70%{ box-shadow:0 0 0 10px rgba(40,199,111,0); }
+  100%{ box-shadow:0 0 0 0 rgba(40,199,111,0); }
+}
+
+/* Simple toggle */
+.switch { position:relative; display:inline-block; width:44px; height:24px; }
+.switch input { display:none; }
+.slider { position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background:#3a4758; transition:.2s; border-radius:999px; }
+.slider:before { position:absolute; content:""; height:18px; width:18px; left:3px; top:3px; background:white; transition:.2s; border-radius:50%; }
+input:checked + .slider { background:#169b62; }
+input:checked + .slider:before { transform:translateX(20px); }
+
+/* Disabled panel overlay */
+.card.disabled { opacity:0.55; pointer-events:none; }
 </style>
 <script>
 function rid(){ return 'evt_' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
@@ -559,14 +586,13 @@ function flashIcon(btn, ok){ if(!btn) return; const cls = ok ? 'show-tick' : 'sh
 async function fetchJSON(url, opts){ const r = await fetch(url, opts); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); }
 async function fetchOK(url, opts){ try{ const r = await fetch(url, opts); return r.ok; }catch(e){ return false; } }
 function copyTxt(t){ navigator.clipboard.writeText(t).catch(()=>{}); }
-function getCookie(name){ return document.cookie.split('; ').find(r=>r.startsWith(name+'='))?.split('=')[1] || ''; }
 </script>
 """
 
 PAGE_HTML_BODY_PREFIX = """
 </head><body>
 <div class="container">
-  <h1>Demo Store Simulator <span class="small">v__APP_VERSION__</span></h1>
+  <h1>Store Simulator <span class="small">v__APP_VERSION__</span></h1>
   __BANNERS__
   <div class="topbar">
     <span class="badge" id="badge_pixel">Pixel: ?</span>
@@ -591,7 +617,7 @@ PAGE_HTML_BODY_PREFIX = """
           <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
         </button>
         <button class="btn" onclick="sendInitiate(this)">InitiateCheckout
-          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
+          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
           <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
         </button>
         <button class="btn" onclick="sendPurchase(this)">Purchase
@@ -601,17 +627,12 @@ PAGE_HTML_BODY_PREFIX = """
       </div>
 
       <div class="row">
-        <label class="small">Mirror Pixel → CAPI</label>
-        <input id="mirror_to_capi" type="checkbox"/>
-      </div>
-
-      <div class="row">
         <span class="small">Next Event Preview:</span>
         <pre id="previewBox" style="width:100%; background:#0b1320; border:1px solid var(--bd); border-radius:10px; padding:8px; margin-top:6px; height:120px; overflow:auto;">{}</pre>
       </div>
     </div>
 
-    <!-- NEW: Pixel Auto (browser-side) -->
+    <!-- Pixel Auto (browser-side) -->
     <div class="card">
       <h3>Pixel Auto (browser → Pixel)</h3>
       <p class="small">Automatically fires Meta Pixel events from the browser. Respects Enable Pixel, currency/price nulls, mismatch, and event-ID toggles.</p>
@@ -620,16 +641,9 @@ PAGE_HTML_BODY_PREFIX = """
         <input id="px_rps" type="number" step="0.1" min="0.1" value="0.5"/>
       </div>
       <div class="row">
-        <button id="pxStartBtn" class="btn" onclick="pixelAutoStart(this)">
-          Start
-          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
-          <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
-        </button>
-        <button id="pxStopBtn" class="btn" onclick="pixelAutoStop(this)" disabled>
-          Stop
-          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
-          <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
-        </button>
+        <button id="pxStartBtn" class="btn" onclick="pixelAutoStart(this)">Start</button>
+        <button id="pxStopBtn" class="btn" onclick="pixelAutoStop(this)" disabled>Stop</button>
+        <span class="dot hidden" id="px_dot" aria-label="Pixel auto running"></span>
       </div>
       <p id="px_status" class="small">Stopped</p>
     </div>
@@ -641,14 +655,9 @@ PAGE_HTML_BODY_PREFIX = """
         <label>Sessions/sec</label><input id="rps" type="number" step="0.1" min="0.1" value="0.5"/>
       </div>
       <div class="row">
-        <button id="startBtn" class="btn" onclick="startAuto(this)">Start
-          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
-          <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
-        </button>
-        <button id="stopBtn" class="btn" onclick="stopAuto(this)">Stop
-          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
-          <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
-        </button>
+        <button id="startBtn" class="btn" onclick="startAuto(this)">Start</button>
+        <button id="stopBtn" class="btn" onclick="stopAuto(this)">Stop</button>
+        <span class="dot hidden" id="sv_dot" aria-label="Server auto running"></span>
       </div>
       <p id="status" class="small">…</p>
       <div class="row small">
@@ -675,10 +684,8 @@ PAGE_HTML_BODY_PREFIX = """
       <p class="small">Seed makes traffic repeatable. Presets capture all controls below.</p>
     </div>
 
-    <div class="card" data-panel="adv">
+    <div class="card">
       <h3>Advanced Controls</h3>
-      <div class="row"><label class="small">Visible</label><input id="toggle_adv" type="checkbox" checked/></div>
-      <hr/>
       <div class="row"><label class="small">Enable Pixel</label><input id="enable_pixel" type="checkbox"/></div>
       <div class="row"><label class="small">Enable CAPI</label><input id="enable_capi" type="checkbox"/></div>
       <hr/>
@@ -712,10 +719,12 @@ PAGE_HTML_BODY_PREFIX = """
       <div class="row"><label>PLTV max</label><input id="pltv_max" type="number" step="0.01" min="0" value="600"/></div>
     </div>
 
-    <div class="card" data-panel="chaos">
-      <h3>Discrepancy & Chaos</h3>
-      <div class="row"><label class="small">Visible</label><input id="toggle_chaos" type="checkbox" checked/></div>
-      <hr/>
+    <div class="card" id="chaos_card">
+      <h3>Discrepancy &amp; Chaos</h3>
+      <div class="row">
+        <label class="small">Enable</label>
+        <label class="switch"><input id="chaos_enabled" type="checkbox"><span class="slider"></span></label>
+      </div>
       <div class="row"><label>Mismatch value ±%</label><input id="mismatch_value_pct" type="number" step="0.01" min="0" max="1" value="0"/></div>
       <div class="row"><label>Mismatch currency</label>
         <select id="mismatch_currency"><option>NONE</option><option>PIXEL</option><option>CAPI</option></select>
@@ -742,7 +751,7 @@ PAGE_HTML_BODY_PREFIX = """
     </div>
 
     <div class="card">
-      <h3>Sinks & Tools</h3>
+      <h3>Sinks &amp; Tools</h3>
       <div class="row"><label>Webhook sink</label><input id="enable_webhook" type="checkbox"/></div>
       <div class="row"><label>GA4 sink</label><input id="enable_ga4" type="checkbox"/></div>
       <div class="row"><button class="btn" onclick="saveConfig(this)">Save Controls</button></div>
@@ -751,12 +760,10 @@ PAGE_HTML_BODY_PREFIX = """
     </div>
 
     <div class="card">
-      <h3>Dataset Quality Helper</h3>
-      <p class="small">Summarizes last 100 server (CAPI) events: presence of match keys.</p>
-      <div class="row small">
-        <button class="btn" onclick="refreshDQ(this)">Refresh</button>
-        <span id="dq_text">…</span>
-      </div>
+      <h3>Self Test</h3>
+      <p class="small">Checks env, then sends a tiny test event via CAPI (uses Test Event Code if set).</p>
+      <div class="row"><button class="btn" onclick="runSelfTest(this)">Run Self Test</button></div>
+      <pre id="selftest_out" class="small" style="background:#0b1320; border:1px solid var(--bd); border-radius:10px; padding:8px; height:120px; overflow:auto;">(no output)</pre>
     </div>
 
     <div class="card" style="grid-column:1/-1;">
@@ -773,9 +780,8 @@ PAGE_HTML_BODY_PREFIX = """
 
     <div class="card" style="grid-column:1/-1;">
       <h3>Scenario Runner (JSON)</h3>
-      <p class="small">Paste a simple JSON scenario (steps with event types and waits). Example:
-      <code>{{"name":"cart_abandon","steps":[{{"page_view":{{"url":"/"}}}},{{"product_view":{{"sku":"SKU-10123"}}}},{{"add_to_cart":{{"qty":1}}}},{{"wait":12}},{{"begin_checkout":{{}}}}]}}</code></p>
-      <textarea id="scenario_text" placeholder='{{"name":"demo","steps":[{{"page_view":{{}}}},{{"product_view":{{}}}},{{"add_to_cart":{{"qty":1}}}},{{"begin_checkout":{{}}}},{{"purchase":{{}}}}]}}'></textarea>
+      <p class="small">Paste a simple JSON scenario (steps with event types and waits).</p>
+      <textarea id="scenario_text" placeholder='{"name":"demo","steps":[{"page_view":{}},{"product_view":{}},{"add_to_cart":{"qty":1}},{"begin_checkout":{}},{"purchase":{}}]}'></textarea>
       <div class="row"><button class="btn" onclick="runScenario(this)">Run Scenario</button></div>
       <p id="scenario_status" class="small">…</p>
     </div>
@@ -834,7 +840,8 @@ function attachMarginPltv(payload, price, cfg){
 function currentCurrency(channel){
   const mode = (document.getElementById('currency_override').value || 'AUTO').toUpperCase();
   const bad = readBadToggles();
-  const mm = (document.getElementById('mismatch_currency').value||'NONE').toUpperCase();
+  const chaosOn = document.getElementById('chaos_enabled').checked;
+  const mm = chaosOn ? (document.getElementById('mismatch_currency').value||'NONE').toUpperCase() : 'NONE';
   if (mm==='PIXEL' && channel==='pixel') return null;
   if (mode==='NULL') return null;
   if (bad.null_currency) return null;
@@ -851,22 +858,27 @@ function updatePreview(){
 }
 
 // ----- Discrepancy helpers -----
+function chaosOn(){ return document.getElementById('chaos_enabled').checked; }
 function maybeMismatchValue(val){
+  if (!chaosOn()) return val;
   const pct = parseFloat(document.getElementById('mismatch_value_pct').value||'0');
   if (!pct || !val) return val;
   const delta = val * pct;
   return Math.round((val + randBetween(-delta, delta))*100)/100;
 }
 function maybeDesyncEventId(eid){
+  if (!chaosOn()) return eid;
   return document.getElementById('desync_event_id').checked ? eid + '_px' : eid;
 }
 function maybeDropPixel(){
+  if (!chaosOn()) return false;
   const n = parseInt(document.getElementById('drop_pixel_every_n').value||'0',10);
   if (!n) return false;
   window.__pxCount = (window.__pxCount||0) + 1;
   return window.__pxCount % n === 0;
 }
 function maybeDupePixelId(eid){
+  if (!chaosOn()) return eid;
   const n = parseInt(document.getElementById('duplicate_event_id_n').value||'0',10);
   if (!n) return eid;
   window.__dupeIdx = (window.__dupeIdx||0) + 1;
@@ -889,15 +901,6 @@ async function sendPixel(name, payload, opts, btn){
   }
   try { fbq('track', name, payload, { eventID: eid }); } catch(e) {}
   await fetch('/metrics/pixel', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({event_name:name,intended, sent:payload, event_id:eid})}).catch(()=>{});
-
-  // Mirror to CAPI if enabled (shares event_id for dedup). Includes fbp/fbc cookies when present.
-  try {
-    if (document.getElementById('mirror_to_capi')?.checked) {
-      const body = { event_name: name, payload, event_id: eid, fbp: getCookie('_fbp')||null, fbc: getCookie('_fbc')||null };
-      await fetch('/mirror/pixel', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) });
-    }
-  } catch(e){}
-
   flashIcon(btn, true);
 }
 
@@ -969,6 +972,7 @@ function pixelAutoStart(btn){
   document.getElementById('px_status').textContent = 'Running at ' + (Math.round((1000/interval)*100)/100) + ' events/sec';
   document.getElementById('pxStartBtn').disabled = true;
   document.getElementById('pxStopBtn').disabled = false;
+  document.getElementById('px_dot').classList.remove('hidden');
   flashIcon(btn, true);
 }
 
@@ -978,6 +982,7 @@ function pixelAutoStop(btn){
   document.getElementById('px_status').textContent = 'Stopped';
   document.getElementById('pxStartBtn').disabled = false;
   document.getElementById('pxStopBtn').disabled = true;
+  document.getElementById('px_dot').classList.add('hidden');
   flashIcon(btn, true);
 }
 
@@ -986,6 +991,7 @@ function pxRefreshStatus(){
   document.getElementById('px_status').textContent = running ? 'Running' : 'Stopped';
   document.getElementById('pxStartBtn').disabled = running;
   document.getElementById('pxStopBtn').disabled = !running;
+  document.getElementById('px_dot').classList.toggle('hidden', !running);
 }
 
 // ----- Auto stream controls (server) -----
@@ -996,6 +1002,7 @@ async function refreshStatus(){
     document.getElementById('startBtn').disabled = j.running;
     document.getElementById('stopBtn').disabled = !j.running;
     if (j.running) document.getElementById('rps').value = j.rps;
+    document.getElementById('sv_dot').classList.toggle('hidden', !j.running);
   } catch(e){ document.getElementById('status').textContent = 'Unknown'; }
 }
 async function startAuto(btn){
@@ -1041,6 +1048,13 @@ async function resetDefaults(btn){
 }
 
 // ----- Config I/O -----
+function setChaosCardDisabled(disabled){
+  const card = document.getElementById('chaos_card');
+  card.classList.toggle('disabled', disabled);
+  // Disable all inputs in card except the main toggle
+  const inputs = card.querySelectorAll('input, select');
+  inputs.forEach(el => { if (el.id !== 'chaos_enabled') el.disabled = disabled; });
+}
 async function loadConfig(){
   const cfg = await fetchJSON('/auto/config');
   ENABLE_PIXEL = !!cfg.enable_pixel;
@@ -1088,6 +1102,10 @@ async function loadConfig(){
   document.getElementById('kill_Purchase').checked = !!(cfg.kill_event_types||{})["Purchase"];
   document.getElementById('enable_webhook').checked = !!cfg.enable_webhook;
   document.getElementById('enable_ga4').checked = !!cfg.enable_ga4;
+  // Chaos toggle
+  document.getElementById('chaos_enabled').checked = !!cfg.chaos_enabled;
+  setChaosCardDisabled(!cfg.chaos_enabled);
+
   updateBadges(); updatePreview();
 }
 async function saveConfig(btn){
@@ -1114,6 +1132,7 @@ async function saveConfig(btn){
     append_pltv: document.getElementById('append_pltv').checked,
     pltv_min: parseFloat(document.getElementById('pltv_min').value||'120'),
     pltv_max: parseFloat(document.getElementById('pltv_max').value||'600'),
+    chaos_enabled: document.getElementById('chaos_enabled').checked,
     mismatch_value_pct: parseFloat(document.getElementById('mismatch_value_pct').value||'0'),
     mismatch_currency: document.getElementById('mismatch_currency').value||'NONE',
     desync_event_id: document.getElementById('desync_event_id').checked,
@@ -1141,6 +1160,7 @@ async function saveConfig(btn){
   flashIcon(btn, ok);
   if (ok) setTimeout(refreshStatus, 250);
   updateBadges(); updatePreview();
+  setChaosCardDisabled(!body.chaos_enabled);
 }
 function updateBadges(){
   fetchJSON('/auto/config').then(cfg => {
@@ -1180,36 +1200,25 @@ async function pollMetrics(){
 setInterval(pollMetrics, 1000);
 
 // ----- Event console -----
-let __eventsCache = [];
-function inspectIdx(i){
-  const r = __eventsCache[i];
-  if(!r) return;
-  const modal = document.getElementById('inspect_modal');
-  document.getElementById('inspect_text').textContent = JSON.stringify(r, null, 2);
-  modal.style.display='flex';
-}
-function closeInspect(){ document.getElementById('inspect_modal').style.display='none'; }
-
 async function refreshConsole(btn){
   const ch = document.getElementById('f_channel').value;
   const ty = document.getElementById('f_type').value;
   const ok = document.getElementById('f_ok').value;
   const q = new URLSearchParams(); if (ch) q.set('channel', ch); if (ty) q.set('type',ty); if (ok) q.set('ok', ok);
   const j = await fetchJSON('/api/events?'+q.toString());
-  __eventsCache = j.items;
-  const rows = j.items.map((r,idx) => `
+  const rows = j.items.map(r => `
     <tr>
       <td class="small">${r.ts}</td>
       <td>${r.channel}</td>
       <td>${r.event_name||''}</td>
       <td class="small">${r.ok?'ok':'err'}</td>
       <td class="small"><button class="btn" onclick='copyTxt(JSON.stringify({intended: r.intended, sent:r.sent}, null, 2))'>Copy</button></td>
-      <td class="small"><button class="btn" onclick='inspectIdx(${idx})'>Inspect</button></td>
+      <td class="small"><button class="btn" onclick='alert(JSON.stringify(r.response||{}, null, 2))'>Resp</button></td>
     </tr>
   `).join('');
   document.getElementById('console_table').innerHTML = `
     <table class="table">
-      <thead><tr><th>time</th><th>channel</th><th>type</th><th>status</th><th>payload</th><th>inspect</th></tr></thead>
+      <thead><tr><th>time</th><th>channel</th><th>type</th><th>status</th><th>payload</th><th>resp</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
 }
@@ -1230,58 +1239,29 @@ async function downloadReplay(){
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'replay_bundle.json'; a.click();
 }
 
-// ----- DQ helper -----
-async function refreshDQ(btn){
+// ----- Self Test -----
+async function runSelfTest(btn){
+  const out = document.getElementById('selftest_out');
+  out.textContent = 'Running...';
   try{
-    const j = await fetchJSON('/dq/keys');
-    const parts = [];
-    parts.push('events analyzed: '+j.total);
-    for(const k of ['external_id','fbp','fbc','client_ip_address','client_user_agent']){
-      const c = j.keys[k]||0;
-      parts.push(k+': '+c);
-    }
-    document.getElementById('dq_text').textContent = parts.join(' | ');
-    if(btn) flashIcon(btn,true);
-  }catch(e){ if(btn) flashIcon(btn,false); }
-}
-
-// ----- Panel visibility -----
-function applyPanelVisibility(){
-  const adv = document.querySelector('[data-panel="adv"]');
-  const chaos = document.querySelector('[data-panel="chaos"]');
-  const advOn = document.getElementById('toggle_adv').checked;
-  const chOn = document.getElementById('toggle_chaos').checked;
-  // Keep first two children (title+toggle row) visible; hide the rest
-  function setCard(card, on){
-    if(!card) return;
-    [...card.children].forEach((el, idx)=>{ if(idx>1) el.style.display = on ? '' : 'none'; });
+    const r = await fetchJSON('/selftest/run', {method:'POST'});
+    out.textContent = JSON.stringify(r, null, 2);
+  }catch(e){
+    out.textContent = 'Error: ' + e;
   }
-  setCard(adv, advOn);
-  setCard(chaos, chOn);
 }
-
-document.getElementById('toggle_adv').addEventListener('change', applyPanelVisibility);
-document.getElementById('toggle_chaos').addEventListener('change', applyPanelVisibility);
 
 // ----- Init -----
 window.addEventListener('load', async () => {
   await loadConfig(); updatePreview(); refreshStatus(); pollMetrics(); refreshConsole();
   pxRefreshStatus(); // initialize Pixel Auto controls
-  applyPanelVisibility();
+  document.getElementById('chaos_enabled').addEventListener('change', ()=>{
+    setChaosCardDisabled(!document.getElementById('chaos_enabled').checked);
+  });
   if (document.getElementById('enable_pixel').checked) { try { fbq('track','PageView'); } catch(e){} }
 });
 </script>
 <noscript><img height="1" width="1" style="display:none" src="https://www.facebook.com/tr?id=__PIXEL_ID__&ev=PageView&noscript=1"/></noscript>
-
-<!-- Inspector Modal -->
-<div id="inspect_modal" class="modal" onclick="closeInspect()">
-  <div class="panel" onclick="event.stopPropagation()">
-    <span class="close" onclick="closeInspect()">✕</span>
-    <h4>Event Inspector</h4>
-    <pre id="inspect_text" style="white-space:pre-wrap;"></pre>
-  </div>
-</div>
-
 </div></body></html>
 """
 
@@ -1308,7 +1288,6 @@ def home():
 # -------------------- Metrics endpoints --------------------
 @app.post("/metrics/pixel")
 def metrics_pixel():
-    """Client pings here when it fires a Pixel event so we can power dedup & diff."""
     try:
         body = request.get_json(force=True) or {}
     except Exception:
@@ -1464,11 +1443,14 @@ def _send_one_through_sinks(sim_evt, cfg):
     ga4_events  = map_sim_event_to_ga4(sim_evt, cfg) if cfg.get("enable_ga4") else []
 
     kill = cfg.get("kill_event_types", {})
+    if not cfg.get("chaos_enabled", True):
+        # when chaos is off, kill switches are considered off
+        kill = {"PageView": False, "ViewContent": False, "AddToCart": False, "InitiateCheckout": False, "Purchase": False, "ReturnInitiated": False}
     for ev in capi_events:
         if kill.get(ev.get("event_name",""), False):
             return
 
-    lag = float(cfg.get("lag_capi_seconds", 0.0))
+    lag = float(chaos(cfg, "lag_capi_seconds", 0.0) or 0.0)
     if lag > 0: time.sleep(max(0.0, lag))
 
     # Post CAPI
@@ -1590,10 +1572,9 @@ def auto_status():
         rps = round(CONFIG["rps"], 2)
     return jsonify({"ok": True, "running": running, "rps": rps})
 
-# -------------------- /ingest forwarder (client → server → CAPI) --------------------
+# -------------------- /ingest forwarder --------------------
 @app.post("/ingest")
 def ingest():
-    """Accept a single sim event and forward to CAPI/sinks."""
     try:
         sim_event = request.get_json(force=True)
     except Exception:
@@ -1604,68 +1585,6 @@ def ingest():
         return {"ok": True}
     except Exception as e:
         return {"ok": False, "error": str(e)}, 500
-
-# -------------------- Pixel → CAPI mirror (shares event_id) --------------------
-@app.post("/mirror/pixel")
-def mirror_pixel():
-    """
-    Accepts a simple pixel-style payload and forwards to CAPI with the same event_id,
-    allowing deduplication tests against browser pixel events.
-    Body: { event_name, payload, event_id, fbp?, fbc? }
-    """
-    try:
-        body = request.get_json(force=True) or {}
-    except Exception:
-        return {"ok": False, "error": "invalid JSON"}, 400
-
-    event_name = body.get("event_name") or ""
-    payload = body.get("payload") or {}
-    event_id = body.get("event_id")
-    fbp = body.get("fbp") or None
-    fbc = body.get("fbc") or None
-
-    cfg = get_cfg_snapshot()
-
-    # Build minimal CAPI event
-    ev = {
-        "event_name": event_name,
-        "event_time": int(time.time()),
-        "action_source": "website",
-        "event_id": event_id,
-        "event_source_url": BASE_URL.rstrip("/") + "/pixel-test",
-        "user_data": {
-            "client_ip_address": request.remote_addr or "127.0.0.1",
-            "client_user_agent": request.headers.get("User-Agent","Mirror/1.0"),
-        },
-        "custom_data": {}
-    }
-    if isinstance(payload, dict):
-        # allow currency/value/contents/etc to pass through
-        for k in ("currency","value","contents","content_ids","content_type","predicted_ltv","margin"):
-            if k in payload:
-                ev.setdefault("custom_data", {})[k] = payload[k]
-    # fbp/fbc pass-through
-    if fbp: ev["user_data"]["fbp"] = fbp
-    if fbc: ev["user_data"]["fbc"] = fbc
-
-    try:
-        resp = capi_post([ev], cfg)
-        ok = True
-    except requests.HTTPError as e:
-        resp = {"error": str(e), "text": getattr(e.response,'text','')[:400]}
-        ok = False
-    except Exception as e:
-        resp = {"error": str(e)}
-        ok = False
-
-    entry = {
-        "ts": now_iso(), "channel":"capi", "event_name": event_name,
-        "intended": {"mirror": True, "pixel_payload": payload}, "sent": ev, "response": resp,
-        "ok": ok, "event_id": event_id
-    }
-    _log_event(entry)
-    _ndjson_append({"channel":"capi","event":entry})
-    return jsonify({"ok": ok, "response": resp})
 
 # -------------------- Config endpoints --------------------
 @app.route("/auto/config", methods=["GET", "POST"])
@@ -1681,7 +1600,7 @@ def auto_config():
 
     with CONFIG_LOCK:
         # master
-        for k in ("enable_pixel","enable_capi","enable_webhook","enable_ga4","append_margin","append_pltv","null_price","null_currency","null_event_id","desync_event_id","schema_remove_contents","schema_empty_arrays","schema_str_numbers","schema_unknown_fields"):
+        for k in ("enable_pixel","enable_capi","enable_webhook","enable_ga4","append_margin","append_pltv","null_price","null_currency","null_event_id","desync_event_id","schema_remove_contents","schema_empty_arrays","schema_str_numbers","schema_unknown_fields","chaos_enabled"):
             if k in body: CONFIG[k] = to_bool(body[k], CONFIG.get(k,False))
         # traffic
         if "rps" in body: CONFIG["rps"] = clampf(body["rps"], 0.1, 10.0, CONFIG["rps"])
@@ -1786,7 +1705,6 @@ def scenario_run():
 # -------------------- Replay export --------------------
 @app.get("/replay/export")
 def replay_export():
-    """Return a replayable bundle: last N capi events with timestamps."""
     with METRICS_LOCK:
         items = [e for e in list(EVENT_LOG) if e.get("channel")=="capi"][:200]
     bundle = {
@@ -1796,22 +1714,34 @@ def replay_export():
     }
     return jsonify(bundle)
 
-# -------------------- Dataset Quality summary --------------------
-@app.get("/dq/keys")
-def dq_keys():
-    """Summarize presence of key fields in last 100 CAPI events."""
-    with METRICS_LOCK:
-        items = [e for e in list(EVENT_LOG) if e.get("channel")=="capi"][:100]
-    keys = {"external_id":0,"fbp":0,"fbc":0,"client_ip_address":0,"client_user_agent":0}
-    for e in items:
-        sent = e.get("sent") or {}
-        ud = (sent.get("user_data") or {})
-        if ud.get("external_id"): keys["external_id"] += 1
-        if ud.get("fbp"): keys["fbp"] += 1
-        if ud.get("fbc"): keys["fbc"] += 1
-        if ud.get("client_ip_address"): keys["client_ip_address"] += 1
-        if ud.get("client_user_agent"): keys["client_user_agent"] += 1
-    return jsonify({"total": len(items), "keys": keys})
+# -------------------- Self Test --------------------
+@app.post("/selftest/run")
+def selftest_run():
+    info = {"capi_ready": bool(CAPI_URL and ACCESS_TOKEN), "pixel_ready": bool(PIXEL_ID), "ga4_ready": bool(GA4_URL)}
+    results = {"ok": True, "info": info}
+    # send a tiny server-side Purchase to Test Events if possible
+    if info["capi_ready"]:
+        try:
+            evt = {
+                "event_name":"Purchase",
+                "event_time": int(time.time()),
+                "event_id": "selftest_"+_uid()[:12],
+                "action_source": "website",
+                "event_source_url": BASE_URL,
+                "user_data": {"external_id": sha256_norm("selftest_user"), "client_ip_address":"127.0.0.1", "client_user_agent":"SelfTest/1.0"},
+                "custom_data": {"currency":"USD", "value": 1.23}
+            }
+            payload = {"data":[evt]}
+            if TEST_EVENT_CODE:
+                payload["test_event_code"] = TEST_EVENT_CODE
+            r = requests.post(CAPI_URL, params={"access_token": ACCESS_TOKEN}, json=payload, timeout=10)
+            results["capi_status"] = r.status_code
+            results["capi_text"] = r.text[:400]
+            results["ok"] = (200 <= r.status_code < 300)
+        except Exception as e:
+            results["ok"] = False
+            results["error"] = str(e)
+    return jsonify(results)
 
 # -------------------- Health & version --------------------
 @app.get("/healthz")
