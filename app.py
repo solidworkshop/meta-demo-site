@@ -24,6 +24,7 @@ CAPI_URL        = f"https://graph.facebook.com/{GRAPH_VER}/{PIXEL_ID}/events" if
 GA4_MEASUREMENT_ID = os.getenv("GA4_MEASUREMENT_ID", "")
 GA4_API_SECRET     = os.getenv("GA4_API_SECRET", "")
 GA4_URL            = f"https://www.google-analytics.com/mp/collect?measurement_id={GA4_MEASUREMENT_ID}&api_secret={GA4_API_SECRET}" if (GA4_MEASUREMENT_ID and GA4_API_SECRET) else None
+GA4_CLIENT_ID      = str(uuid.uuid4())  # stable per-process client_id for coherence
 
 WEBHOOK_URL     = os.getenv("WEBHOOK_URL", "")
 try:
@@ -33,7 +34,7 @@ except Exception:
 
 FILE_SINK_PATH  = os.getenv("FILE_SINK_PATH", "")  # e.g. "events.ndjson"
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 
 app = Flask(__name__)
 
@@ -81,7 +82,7 @@ CONFIG: Dict[str, Any] = {
 
     # discrepancy toggles
     "mismatch_value_pct": 0.0,        # e.g. 0.15 -> ±15% applied to Pixel when >0
-    "mismatch_currency": "NONE",      # NONE | PIXEL | CAPI
+    "mismatch_currency": "NONE",      # NONE | PIXEL | CAPI | PIXEL_NULL | CAPI_NULL
     "desync_event_id": False,         # pixel uses a different event_id than capi
     "duplicate_event_id_n": 0,        # 0 disables; else duplicate every Nth Pixel event_id
     "drop_pixel_every_n": 0,          # drop every Nth Pixel event
@@ -121,10 +122,41 @@ reseed()
 
 # -------------------- Telemetry & storage --------------------
 EVENT_LOG_MAX = 800
-EVENT_LOG: deque = deque(maxlen=EVENT_LOG_MAX)  # dicts: {ts, channel, event_name, intended, sent, response, ok, event_id, diff}
+EVENT_LOG: deque = deque(maxlen=EVENT_LOG_MAX)  # dicts: {ts, channel, event_name, intended, sent, response, ok, event_id, diff, status_code, latency_ms}
 COUNTS = defaultdict(int)
-DEDUP = {"pixel_ids": set(), "capi_ids": set(), "matched": 0, "pixel_only": 0, "capi_only": 0}
+
+# bounded dedup memory (10k ids per channel)
+_DEDUP_MAX = 10000
+DEDUP = {
+    "pixel_ids": set(),
+    "capi_ids": set(),
+    "pixel_q": deque(maxlen=_DEDUP_MAX),
+    "capi_q": deque(maxlen=_DEDUP_MAX),
+    "matched": 0, "pixel_only": 0, "capi_only": 0,
+    "last_capi_status": None,
+    "last_capi_latency_ms": None
+}
 METRICS_LOCK = threading.Lock()
+
+def _dedup_add(channel:str, eid:str):
+    if not eid: return
+    dq = DEDUP["pixel_q"] if channel=="pixel" else DEDUP["capi_q"]
+    st = DEDUP["pixel_ids"] if channel=="pixel" else DEDUP["capi_ids"]
+    # if maxlen evicts, remove from set
+    if len(dq) == dq.maxlen and dq.maxlen is not None:
+        old = dq[0]
+        # We'll let natural set growth; sets don't track counts, so we rebuild below for accuracy
+    dq.append(eid)
+    st.add(eid)
+    # Recompute sets from deques to ensure accuracy
+    if channel=="pixel":
+        DEDUP["pixel_ids"] = set(DEDUP["pixel_q"])
+    else:
+        DEDUP["capi_ids"] = set(DEDUP["capi_q"])
+    common = DEDUP["pixel_ids"].intersection(DEDUP["capi_ids"])
+    DEDUP["matched"] = len(common)
+    DEDUP["pixel_only"] = len(DEDUP["pixel_ids"] - common)
+    DEDUP["capi_only"]  = len(DEDUP["capi_ids"] - common)
 
 def _log_event(entry: Dict[str,Any]):
     with METRICS_LOCK:
@@ -138,14 +170,10 @@ def _log_event(entry: Dict[str,Any]):
             COUNTS["errors"] += 1
         eid = (entry.get("event_id") or "")
         if eid:
-            if ch == "pixel":
-                DEDUP["pixel_ids"].add(eid)
-            elif ch == "capi":
-                DEDUP["capi_ids"].add(eid)
-            common = DEDUP["pixel_ids"].intersection(DEDUP["capi_ids"])
-            DEDUP["matched"] = len(common)
-            DEDUP["pixel_only"] = len(DEDUP["pixel_ids"] - common)
-            DEDUP["capi_only"]  = len(DEDUP["capi_ids"] - common)
+            _dedup_add(ch, eid)
+        if ch == "capi":
+            DEDUP["last_capi_status"] = entry.get("status_code")
+            DEDUP["last_capi_latency_ms"] = entry.get("latency_ms")
 
 def _ndjson_append(row: Dict[str,Any]):
     if not FILE_SINK_PATH:
@@ -257,6 +285,12 @@ def append_margin_pltv(custom_data, cfg, single_price=None, contents=None):
 def _apply_currency_override(cur, cfg, channel="capi"):
     ov = (cfg.get("currency_override") or "AUTO").upper()
     mm = (cfg.get("mismatch_currency") or "NONE").upper()
+    # explicit null-forced modes
+    if mm == "PIXEL_NULL" and channel == "pixel":
+        return None
+    if mm == "CAPI_NULL" and channel == "capi":
+        return None
+    # legacy mismatch modes (preserved)
     if mm == "PIXEL" and channel == "pixel":
         return None if cur else "USD"
     if mm == "CAPI" and channel == "capi":
@@ -292,12 +326,24 @@ def _apply_clock_skew(ts_unix, cfg):
     skew = int(cfg.get("clock_skew_seconds", 0))
     return int(ts_unix + skew)
 
+def _get_client_ip():
+    # proxy-aware IP
+    if has_request_context():
+        xff = request.headers.get("X-Forwarded-For", "")
+        if xff:
+            # take first IP
+            ip = xff.split(",")[0].strip()
+            if ip:
+                return ip
+        return request.remote_addr or "127.0.0.1"
+    return "127.0.0.1"
+
 # -------------------- Posting sinks --------------------
 def capi_post(server_events, cfg):
     if not cfg.get("enable_capi"):
-        return {"skipped": True, "reason": "enable_capi=false"}
+        return {"skipped": True, "reason": "enable_capi=false", "ok": True}
     if not CAPI_URL or not ACCESS_TOKEN:
-        return {"skipped": True, "reason": "missing_capi_config"}
+        return {"skipped": True, "reason": "missing_capi_config", "ok": False}
 
     lat = int(cfg.get("net_capi_latency_ms", 0))
     if lat > 0: time.sleep(lat/1000.0)
@@ -308,31 +354,40 @@ def capi_post(server_events, cfg):
     payload = {"data": server_events}
     if TEST_EVENT_CODE:
         payload["test_event_code"] = TEST_EVENT_CODE
+    t0 = time.time()
     r = requests.post(
         CAPI_URL,
         params={"access_token": ACCESS_TOKEN},
         json=payload,
         timeout=10
     )
-    r.raise_for_status()
-    return r.json()
+    t1 = time.time()
+    try:
+        r.raise_for_status()
+        return {"ok": True, "status_code": r.status_code, "latency_ms": int((t1-t0)*1000), "json": r.json()}
+    except requests.HTTPError:
+        return {"ok": False, "status_code": r.status_code, "latency_ms": int((t1-t0)*1000), "text": getattr(r,'text','')[:500]}
 
 def webhook_post(server_events, cfg):
-    if not cfg.get("enable_webhook"): return {"skipped": True}
-    if not WEBHOOK_URL: return {"skipped": True, "reason":"missing_webhook_url"}
+    if not cfg.get("enable_webhook"): return {"skipped": True, "ok": True}
+    if not WEBHOOK_URL: return {"skipped": True, "reason":"missing_webhook_url", "ok": False}
     try:
+        t0 = time.time()
         r = requests.post(WEBHOOK_URL, headers=WEBHOOK_HEADERS, json={"events": server_events}, timeout=10)
-        return {"status": r.status_code, "ok": r.ok}
+        t1 = time.time()
+        return {"status": r.status_code, "ok": r.ok, "latency_ms": int((t1-t0)*1000)}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
 def ga4_post(mapped_events: List[Dict[str,Any]], cfg):
-    if not cfg.get("enable_ga4"): return {"skipped": True}
-    if not GA4_URL: return {"skipped": True, "reason":"missing_ga4_config"}
-    body = {"client_id": str(uuid.uuid4()), "events": mapped_events}
+    if not cfg.get("enable_ga4"): return {"skipped": True, "ok": True}
+    if not GA4_URL: return {"skipped": True, "reason":"missing_ga4_config", "ok": False}
+    body = {"client_id": GA4_CLIENT_ID, "events": mapped_events}
     try:
+        t0 = time.time()
         r = requests.post(GA4_URL, json=body, timeout=10)
-        return {"status": r.status_code, "ok": r.ok, "text": r.text[:300]}
+        t1 = time.time()
+        return {"status": r.status_code, "ok": r.ok, "text": r.text[:300], "latency_ms": int((t1-t0)*1000)}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
@@ -395,7 +450,8 @@ def map_sim_event_to_capi(e, cfg):
         page = "/checkout"
     event_source_url = BASE_URL.rstrip("/") + page
 
-    client_ip = request.remote_addr if has_request_context() else "127.0.0.1"
+    # proxy-aware IP and UA
+    client_ip = _get_client_ip()
     user_agent = (request.headers.get("User-Agent","AutoRunner/1.0") if has_request_context()
                   else "AutoRunner/1.0")
 
@@ -410,6 +466,11 @@ def map_sim_event_to_capi(e, cfg):
             "client_user_agent": user_agent
         }
     }
+    # Optional fbp/fbc passthrough
+    fbp = e.get("fbp") or ctx.get("fbp")
+    fbc = e.get("fbc") or ctx.get("fbc")
+    if fbp: base["user_data"]["fbp"] = fbp
+    if fbc: base["user_data"]["fbc"] = fbc
 
     out = []
     if et == "page_view":
@@ -547,6 +608,11 @@ pre { margin:0; white-space:pre-wrap; word-break:break-word; }
 code { color:#cbd9ff; }
 .warn { color:#ffcf6e }
 .flex { display:flex; gap:10px; }
+.modal { position:fixed; inset:0; display:none; align-items:center; justify-content:center; background:rgba(0,0,0,0.5); z-index:9999;}
+.modal .panel { width:min(920px, 92vw); max-height:80vh; overflow:auto; background:#0b1320; border:1px solid var(--bd); border-radius:12px; padding:12px; }
+.modal .panel h4 { margin:0 0 8px; }
+.modal .close { float:right; cursor:pointer; }
+.pill { border:1px solid var(--bd); padding:2px 6px; border-radius:10px; font-size:11px; }
 </style>
 <script>
 function rid(){ return 'evt_' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
@@ -554,6 +620,7 @@ function flashIcon(btn, ok){ if(!btn) return; const cls = ok ? 'show-tick' : 'sh
 async function fetchJSON(url, opts){ const r = await fetch(url, opts); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); }
 async function fetchOK(url, opts){ try{ const r = await fetch(url, opts); return r.ok; }catch(e){ return false; } }
 function copyTxt(t){ navigator.clipboard.writeText(t).catch(()=>{}); }
+function getCookie(name){ const m=document.cookie.match(new RegExp('(?:^|; )'+name.replace(/([.$?*|{}()\\[\\]\\\\\\/\\+^])/g,'\\\\$1')+'=([^;]*)')); return m?decodeURIComponent(m[1]):''; }
 </script>
 """
 
@@ -569,12 +636,18 @@ PAGE_HTML_BODY_PREFIX = """
     <span class="badge" id="badge_seed">Seed: none</span>
     <span class="badge" id="badge_preset">Preset: Default</span>
     <span class="badge" id="badge_ga4">GA4: __GA4_ONOFF__</span>
+    <button class="btn" onclick="runSelfTest(this)">Self-Test</button>
+    <span class="pill" id="pill_px">PX: -</span>
+    <span class="pill" id="pill_capi">CAPI: -</span>
   </div>
 
   <div class="grid">
     <div class="card">
       <h3>Pixel Test</h3>
-      <p class="small">Sends browser events only if <b>Enable Pixel</b> is on. We also ping the server for telemetry to power the dedup meter.</p>
+      <p class="small">Sends browser events only if <b>Enable Pixel</b> is on. Optionally mirror to CAPI using the same event_id for dedup checks.</p>
+      <div class="row small">
+        <label><input type="checkbox" id="share_eid"/> Share event_id to CAPI</label>
+      </div>
       <div class="row" style="gap:10px; margin-bottom:6px;">
         <button class="btn" onclick="sendView(this)">ViewContent
           <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
@@ -600,7 +673,7 @@ PAGE_HTML_BODY_PREFIX = """
       </div>
     </div>
 
-    <!-- NEW: Pixel Auto (browser-side) -->
+    <!-- Pixel Auto (browser-side) -->
     <div class="card">
       <h3>Pixel Auto (browser → Pixel)</h3>
       <p class="small">Automatically fires Meta Pixel events from the browser. Respects Enable Pixel, currency/price nulls, mismatch, and event-ID toggles.</p>
@@ -703,7 +776,7 @@ PAGE_HTML_BODY_PREFIX = """
       <h3>Discrepancy & Chaos</h3>
       <div class="row"><label>Mismatch value ±%</label><input id="mismatch_value_pct" type="number" step="0.01" min="0" max="1" value="0"/></div>
       <div class="row"><label>Mismatch currency</label>
-        <select id="mismatch_currency"><option>NONE</option><option>PIXEL</option><option>CAPI</option></select>
+        <select id="mismatch_currency"><option>NONE</option><option>PIXEL</option><option>CAPI</option><option>PIXEL_NULL</option><option>CAPI_NULL</option></select>
       </div>
       <div class="row"><label>Desync event_id (Pixel ≠ CAPI)</label><input id="desync_event_id" type="checkbox"/></div>
       <div class="row"><label>Duplicate Pixel ID every N</label><input id="duplicate_event_id_n" type="number" step="1" min="0" value="0"/></div>
@@ -756,8 +829,27 @@ PAGE_HTML_BODY_PREFIX = """
       <p id="scenario_status" class="small">…</p>
     </div>
   </div>
-"""
 
+  <!-- Modal for Payload Inspector -->
+  <div id="inspector" class="modal" role="dialog" aria-modal="true" aria-label="Payload Inspector">
+    <div class="panel">
+      <span class="close" onclick="closeInspect()">✕</span>
+      <h4>Payload Inspector</h4>
+      <div class="row">
+        <div style="flex:1; min-width:280px;">
+          <h5>Sent</h5>
+          <pre id="insp_sent"></pre>
+        </div>
+        <div style="flex:1; min-width:280px;">
+          <h5>Validation</h5>
+          <pre id="insp_val"></pre>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+"""
 PAGE_HTML_FOOT = """
 <script>
 // ----- Pixel loader -----
@@ -812,6 +904,7 @@ function currentCurrency(channel){
   const bad = readBadToggles();
   const mm = (document.getElementById('mismatch_currency').value||'NONE').toUpperCase();
   if (mm==='PIXEL' && channel==='pixel') return null;
+  if (mm==='PIXEL_NULL' && channel==='pixel') return null;
   if (mode==='NULL') return null;
   if (bad.null_currency) return null;
   if (mode!=='AUTO') return mode;
@@ -850,9 +943,13 @@ function maybeDupePixelId(eid){
   window.__lastPxEid = eid;
   return eid;
 }
+function getFbpFbc(){
+  return {fbp:getCookie('_fbp')||'', fbc:getCookie('_fbc')||''};
+}
 
 // ----- Pixel send & server telemetry -----
 let ENABLE_PIXEL = true;
+function updatePill(el, txt){ if(el) el.textContent=txt; }
 async function sendPixel(name, payload, opts, btn){
   if (!ENABLE_PIXEL) { flashIcon(btn, false); return; }
   const intended = JSON.parse(JSON.stringify(payload));
@@ -861,10 +958,26 @@ async function sendPixel(name, payload, opts, btn){
   const eid = maybeDupePixelId(maybeDesyncEventId(eid0));
   if (maybeDropPixel()) {
     await fetch('/metrics/pixel', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({event_name:name,intended, sent:payload, event_id:eid, dropped:true})}).catch(()=>{});
-    flashIcon(btn, true); return;
+    flashIcon(btn, true); updatePill(document.getElementById('pill_px'), 'PX: dropped'); return;
   }
-  try { fbq('track', name, payload, { eventID: eid }); } catch(e) {}
+  try { fbq('track', name, payload, { eventID: eid }); updatePill(document.getElementById('pill_px'), 'PX: ok'); } catch(e) { updatePill(document.getElementById('pill_px'), 'PX: err'); }
   await fetch('/metrics/pixel', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({event_name:name,intended, sent:payload, event_id:eid})}).catch(()=>{});
+  // Shared event-id mode: also send to /ingest with same eid
+  if (document.getElementById('share_eid').checked){
+    const ctx = {currency: currentCurrency('capi')}; const id = getFbpFbc();
+    let sim = {event_id:eid, timestamp:new Date().toISOString(), user:{user_id:'u_browser'}, context:ctx};
+    if (name==='ViewContent'){
+      const price = 68.99; sim.event_type='product_view'; sim.product={product_id:'SKU-10057', price:price};
+    } else if (name==='AddToCart'){
+      const price=68.99; sim.event_type='add_to_cart'; sim.line_item={product_id:'SKU-10057', qty:1, price:price};
+    } else if (name==='InitiateCheckout'){
+      const price=68.99, qty=2, total=149.02; sim.event_type='begin_checkout'; sim.cart=[{product_id:'SKU-10057', qty:qty, price:price}]; sim.total=total;
+    } else if (name==='Purchase'){
+      const price=68.99, qty=2, total=149.02; sim.event_type='purchase'; sim.items=[{product_id:'SKU-10057', qty:qty, price:price}]; sim.total=total;
+    }
+    sim.fbp=id.fbp||undefined; sim.fbc=id.fbc||undefined;
+    await fetch('/ingest', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(sim)}).catch(()=>{});
+  }
   flashIcon(btn, true);
 }
 
@@ -1142,30 +1255,55 @@ async function pollMetrics(){
     sB.push(m.purchases||0); if (sB.length>30) sB=sB.slice(-30);
     drawSpark(sparkSent, sA); drawSpark(sparkPur, sB);
     document.getElementById('dedup').textContent = `Dedup matched: ${m.dedup.matched} | pixel-only: ${m.dedup.pixel_only} | capi-only: ${m.dedup.capi_only}`;
+    if (m.dedup.last_capi_status) updatePill(document.getElementById('pill_capi'), 'CAPI: '+m.dedup.last_capi_status+' • '+(m.dedup.last_capi_latency_ms||'-')+'ms');
   } catch(e) {}
 }
 setInterval(pollMetrics, 1000);
 
 // ----- Event console -----
+function openInspect(sent, resp){
+  const m = document.getElementById('inspector');
+  const val = [];
+  try{
+    const s = sent || {};
+    const cd = (s.custom_data)||{};
+    const hasId = !!(s.event_id);
+    const hasName = !!(s.event_name);
+    const hasVal = (cd.value!==undefined && cd.value!==null && cd.value!=='') || (Array.isArray(cd.contents) && cd.contents.some(c=>c.item_price!==undefined));
+    const hasCur = (cd.currency!==undefined && cd.currency!==null && cd.currency!=='');
+    const hasUA = !!((s.user_data||{}).client_user_agent);
+    const hasIP = !!((s.user_data||{}).client_ip_address);
+    val.push({event_name:hasName, event_id:hasId, value_present:hasVal, currency_present:hasCur, client_ip:hasIP, client_ua:hasUA});
+  }catch(e){}
+  document.getElementById('insp_sent').textContent = JSON.stringify(sent, null, 2);
+  document.getElementById('insp_val').textContent  = JSON.stringify(val[0]||{}, null, 2);
+  m.style.display='flex';
+}
+function closeInspect(){ document.getElementById('inspector').style.display='none'; }
+
 async function refreshConsole(btn){
   const ch = document.getElementById('f_channel').value;
   const ty = document.getElementById('f_type').value;
   const ok = document.getElementById('f_ok').value;
   const q = new URLSearchParams(); if (ch) q.set('channel', ch); if (ty) q.set('type',ty); if (ok) q.set('ok', ok);
   const j = await fetchJSON('/api/events?'+q.toString());
-  const rows = j.items.map(r => `
+  const rows = j.items.map((r,i) => `
     <tr>
       <td class="small">${r.ts}</td>
       <td>${r.channel}</td>
       <td>${r.event_name||''}</td>
       <td class="small">${r.ok?'ok':'err'}</td>
-      <td class="small"><button class="btn" onclick='copyTxt(JSON.stringify({intended: r.intended, sent:r.sent}, null, 2))'>Copy</button></td>
-      <td class="small"><button class="btn" onclick='alert(JSON.stringify(r.response||{}, null, 2))'>Resp</button></td>
+      <td class="small">${r.status_code||''}</td>
+      <td class="small">${r.latency_ms||''}</td>
+      <td class="small">
+        <button class="btn" onclick='copyTxt(JSON.stringify({intended: r.intended, sent:r.sent}, null, 2))'>Copy</button>
+        <button class="btn" onclick='openInspect(r.sent, r.response)'>Inspect</button>
+      </td>
     </tr>
   `).join('');
   document.getElementById('console_table').innerHTML = `
     <table class="table">
-      <thead><tr><th>time</th><th>channel</th><th>type</th><th>status</th><th>payload</th><th>resp</th></tr></thead>
+      <thead><tr><th>time</th><th>channel</th><th>type</th><th>status</th><th>code</th><th>ms</th><th>tools</th></tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
 }
@@ -1184,6 +1322,14 @@ async function downloadReplay(){
   const j = await fetchJSON('/replay/export');
   const blob = new Blob([JSON.stringify(j,null,2)], {type:'application/json'});
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'replay_bundle.json'; a.click();
+}
+
+// ----- Self-Test -----
+async function runSelfTest(btn){
+  try{
+    const j = await fetchJSON('/selftest');
+    alert('Self-Test\\nPixel ready: '+j.pixel_ready+'\\nCAPI ready: '+j.capi_ready+'\\nGA4 ready: '+j.ga4_ready+'\\nSent: '+j.sent+' ok: '+j.ok+' errors: '+j.errors);
+  }catch(e){ alert('Self-Test failed'); }
 }
 
 // ----- Init -----
@@ -1250,7 +1396,9 @@ def metrics():
             "dedup": {
                 "matched": DEDUP["matched"],
                 "pixel_only": DEDUP["pixel_only"],
-                "capi_only": DEDUP["capi_only"]
+                "capi_only": DEDUP["capi_only"],
+                "last_capi_status": DEDUP.get("last_capi_status"),
+                "last_capi_latency_ms": DEDUP.get("last_capi_latency_ms"),
             }
         }
     return jsonify(out)
@@ -1386,10 +1534,14 @@ def _send_one_through_sinks(sim_evt, cfg):
     # Post CAPI
     resp = None
     ok = True
+    status_code = None
+    latency_ms = None
     if capi_events:
         try:
             resp = capi_post(capi_events, cfg)
-            ok = True
+            ok = bool(resp.get("ok", True))
+            status_code = resp.get("status_code")
+            latency_ms = resp.get("latency_ms")
         except requests.HTTPError as e:
             resp = {"error": str(e), "text": getattr(e.response,'text','')[:400]}
             ok = False
@@ -1400,7 +1552,8 @@ def _send_one_through_sinks(sim_evt, cfg):
         for ev in capi_events:
             entry = {
                 "ts": now_iso(), "channel":"capi", "event_name": ev.get("event_name"),
-                "intended": sim_evt, "sent": ev, "response": resp, "ok": ok, "event_id": ev.get("event_id")
+                "intended": sim_evt, "sent": ev, "response": resp, "ok": ok, "event_id": ev.get("event_id"),
+                "status_code": status_code, "latency_ms": latency_ms
             }
             _log_event(entry)
             _ndjson_append({"channel":"capi","event":entry})
@@ -1410,7 +1563,8 @@ def _send_one_through_sinks(sim_evt, cfg):
         wresp = webhook_post(capi_events, cfg)
         entry = {
             "ts": now_iso(), "channel":"webhook", "event_name": capi_events[0].get("event_name") if capi_events else "",
-            "intended": sim_evt, "sent": {"events": capi_events}, "response": wresp, "ok": bool(wresp.get("ok", True))
+            "intended": sim_evt, "sent": {"events": capi_events}, "response": wresp, "ok": bool(wresp.get("ok", True)),
+            "status_code": wresp.get("status"), "latency_ms": wresp.get("latency_ms")
         }
         _log_event(entry)
         _ndjson_append({"channel":"webhook","event":entry})
@@ -1420,7 +1574,8 @@ def _send_one_through_sinks(sim_evt, cfg):
         gresp = ga4_post(ga4_events, cfg)
         entry = {
             "ts": now_iso(), "channel":"ga4", "event_name": ga4_events[0].get("name") if ga4_events else "",
-            "intended": sim_evt, "sent": {"events": ga4_events}, "response": gresp, "ok": bool(gresp.get("ok", True))
+            "intended": sim_evt, "sent": {"events": ga4_events}, "response": gresp, "ok": bool(gresp.get("ok", True)),
+            "status_code": gresp.get("status"), "latency_ms": gresp.get("latency_ms")
         }
         _log_event(entry)
         _ndjson_append({"channel":"ga4","event":entry})
@@ -1510,6 +1665,11 @@ def ingest():
         sim_event = request.get_json(force=True)
     except Exception:
         return {"ok": False, "error": "invalid JSON"}, 400
+    # ensure timestamp if missing
+    sim_event.setdefault("timestamp", now_iso())
+    # ensure minimal user/context
+    sim_event.setdefault("user", {"user_id":"u_browser_shared"})
+    sim_event.setdefault("context", {"currency":"USD"})
     cfg = get_cfg_snapshot()
     try:
         _send_one_through_sinks(sim_event, cfg)
@@ -1557,7 +1717,8 @@ def auto_config():
                         cleaned.append(round(fv, 2))
                 except Exception:
                     pass
-            if cleaned: CONFIG["shipping_options"] = cleaned
+            # allow clearing to []
+            CONFIG["shipping_options"] = cleaned
         if "tax_rate" in body: CONFIG["tax_rate"] = clampf(body["tax_rate"], 0.0, 1.0, CONFIG["tax_rate"])
         # margin + PLTV
         if "cost_pct_min" in body: CONFIG["cost_pct_min"] = clampf(body["cost_pct_min"], 0.0, 1.0, CONFIG["cost_pct_min"])
@@ -1575,7 +1736,7 @@ def auto_config():
             if k in body: CONFIG[k] = clampp(body[k], 0, 10**9, CONFIG[k])
         if "mismatch_currency" in body:
             v = str(body["mismatch_currency"]).upper()
-            CONFIG["mismatch_currency"] = v if v in ("NONE","PIXEL","CAPI") else CONFIG["mismatch_currency"]
+            CONFIG["mismatch_currency"] = v if v in ("NONE","PIXEL","CAPI","PIXEL_NULL","CAPI_NULL") else CONFIG["mismatch_currency"]
         if "kill_event_types" in body:
             d = body["kill_event_types"] or {}
             keep = {}
@@ -1642,18 +1803,33 @@ def replay_export():
     bundle = {
         "version": APP_VERSION,
         "created_at": now_iso(),
-        "events": [{"event_name": e.get("event_name"), "sent": e.get("sent"), "ts": e.get("ts")} for e in items]
+        "events": [{"event_name": e.get("event_name"), "sent": e.get("sent"), "ts": e.get("ts"), "status_code": e.get("status_code"), "latency_ms": e.get("latency_ms")} for e in items]
     }
     return jsonify(bundle)
 
 # -------------------- Health & version --------------------
 @app.get("/healthz")
 def healthz():
-    ok = True
-    msg = []
-    if not PIXEL_ID: msg.append("PIXEL_ID missing")
-    if not ACCESS_TOKEN: msg.append("ACCESS_TOKEN missing")
-    return jsonify({"ok": ok, "warnings": msg})
+    pixel_ready = bool(PIXEL_ID)
+    capi_ready  = bool(PIXEL_ID and ACCESS_TOKEN)
+    ga4_ready   = bool(GA4_URL)
+    ok = pixel_ready or capi_ready
+    return jsonify({"ok": ok, "pixel_ready": pixel_ready, "capi_ready": capi_ready, "ga4_ready": ga4_ready})
+
+@app.get("/selftest")
+def selftest():
+    # simple smoke: returns readiness and a quick count snapshot
+    with METRICS_LOCK:
+        sent_before = COUNTS.get("sent_capi",0) + COUNTS.get("sent_pixel",0)
+        errors_before = COUNTS.get("errors",0)
+    # no-op besides readiness
+    pixel_ready = bool(PIXEL_ID)
+    capi_ready  = bool(PIXEL_ID and ACCESS_TOKEN)
+    ga4_ready   = bool(GA4_URL)
+    with METRICS_LOCK:
+        sent_after = COUNTS.get("sent_capi",0) + COUNTS.get("sent_pixel",0)
+        errors_after = COUNTS.get("errors",0)
+    return jsonify({"pixel_ready":pixel_ready,"capi_ready":capi_ready,"ga4_ready":ga4_ready,"sent":sent_after-sent_before,"ok":(errors_after==errors_before),"errors":errors_after-errors_before})
 
 @app.get("/version")
 def version():
