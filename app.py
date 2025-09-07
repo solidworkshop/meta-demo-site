@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-# E-commerce Simulator v2.1.3
-# Changes in 2.1.3:
-# - Remove "Demo" from page title
-# - Pulsing dot indicator on Pixel Auto + Server Auto when running
-# - Advanced Controls always visible (no "Visible" checkbox)
-# - Discrepancy & Chaos: real ON/OFF toggle disables UI and runtime effects
-# - Self Test card & /selftest/run endpoint restored
+# E-commerce Simulator (v2.1.5): Adds CAPI user_data toggles for em, IP, UA, fbp, fbc
 import os, json, hashlib, time, threading, uuid, math, random
 from datetime import datetime, timezone
 from collections import deque, defaultdict
@@ -36,7 +30,7 @@ except Exception:
 
 FILE_SINK_PATH  = os.getenv("FILE_SINK_PATH", "")  # e.g. "events.ndjson"
 
-APP_VERSION = "2.1.3"
+APP_VERSION = "2.1.5"
 
 app = Flask(__name__)
 
@@ -83,23 +77,22 @@ CONFIG: Dict[str, Any] = {
     "seed": "",  # when set, RNG is seeded
 
     # discrepancy toggles
-    "chaos_enabled": True,           # NEW: master on/off for this panel
-    "mismatch_value_pct": 0.0,       # ±% applied to Pixel when >0
-    "mismatch_currency": "NONE",     # NONE | PIXEL | CAPI
-    "desync_event_id": False,        # pixel uses a different event_id than capi
-    "duplicate_event_id_n": 0,       # 0 disables; else duplicate every Nth Pixel event_id
-    "drop_pixel_every_n": 0,         # drop every Nth Pixel event
-    "lag_capi_seconds": 0.0,         # delay before sending to CAPI
+    "mismatch_value_pct": 0.0,
+    "mismatch_currency": "NONE",      # NONE | PIXEL | CAPI
+    "desync_event_id": False,
+    "duplicate_event_id_n": 0,
+    "drop_pixel_every_n": 0,
+    "lag_capi_seconds": 0.0,
 
     # chaos
-    "net_capi_latency_ms": 0,        # artificial latency (per request)
-    "net_capi_error_rate": 0.0,      # 0..1 force HTTP error (simulate)
+    "net_capi_latency_ms": 0,
+    "net_capi_error_rate": 0.0,
     "schema_remove_contents": False,
     "schema_empty_arrays": False,
-    "schema_str_numbers": False,     # send numbers as strings
+    "schema_str_numbers": False,
     "schema_unknown_fields": False,
-    "clock_skew_seconds": 0,         # ± seconds added to event_time
-    "kill_event_types": {            # master kill per type
+    "clock_skew_seconds": 0,
+    "kill_event_types": {
         "PageView": False, "ViewContent": False, "AddToCart": False,
         "InitiateCheckout": False, "Purchase": False, "ReturnInitiated": False
     },
@@ -107,6 +100,16 @@ CONFIG: Dict[str, Any] = {
     # sinks
     "enable_webhook": False,
     "enable_ga4": False,
+
+    # NEW: user_data toggles and values (for CAPI only)
+    "send_em": False,
+    "send_client_ip": True,
+    "send_client_ua": True,
+    "send_fbp": True,
+    "send_fbc": True,
+    "user_email": "",
+    "fbp": "",
+    "fbc": "",
 
     # presets name (display only)
     "active_preset": "Default"
@@ -257,18 +260,10 @@ def append_margin_pltv(custom_data, cfg, single_price=None, contents=None):
         custom_data["predicted_ltv"] = round(rand_uniform(lo, hi), 2)
     return custom_data
 
-# -------------------- Chaos helpers (server-side switches) --------------------
-def chaos(cfg, key, default_if_off):
-    """Return cfg[key] if chaos enabled, else default neutral value."""
-    if cfg.get("chaos_enabled", True):
-        return cfg.get(key)
-    return default_if_off
-
 # -------------------- Mapping sim → CAPI/GA4 helpers --------------------
 def _apply_currency_override(cur, cfg, channel="capi"):
     ov = (cfg.get("currency_override") or "AUTO").upper()
-    mm_all = (cfg.get("mismatch_currency") or "NONE").upper()
-    mm = mm_all if cfg.get("chaos_enabled", True) else "NONE"
+    mm = (cfg.get("mismatch_currency") or "NONE").upper()
     if mm == "PIXEL" and channel == "pixel":
         return None if cur else "USD"
     if mm == "CAPI" and channel == "capi":
@@ -280,7 +275,7 @@ def _apply_currency_override(cur, cfg, channel="capi"):
     return cur
 
 def _maybe_str_nums(obj, cfg):
-    if not (cfg.get("chaos_enabled", True) and cfg.get("schema_str_numbers")): return obj
+    if not cfg.get("schema_str_numbers"): return obj
     def t(v):
         if isinstance(v, (int, float)): return str(v)
         if isinstance(v, list): return [t(x) for x in v]
@@ -291,17 +286,17 @@ def _maybe_str_nums(obj, cfg):
 def _schema_mutations(custom_data, cfg):
     if not custom_data: return custom_data
     cd = dict(custom_data)
-    if cfg.get("chaos_enabled", True) and cfg.get("schema_remove_contents"):
+    if cfg.get("schema_remove_contents"):
         cd.pop("contents", None)
-    if cfg.get("chaos_enabled", True) and cfg.get("schema_empty_arrays"):
+    if cfg.get("schema_empty_arrays"):
         if "contents" in cd: cd["contents"] = []
         if "content_ids" in cd: cd["content_ids"] = []
-    if cfg.get("chaos_enabled", True) and cfg.get("schema_unknown_fields"):
+    if cfg.get("schema_unknown_fields"):
         cd["unknown_field_xyz"] = "foo"
     return cd
 
 def _apply_clock_skew(ts_unix, cfg):
-    skew = int(chaos(cfg, "clock_skew_seconds", 0) or 0)
+    skew = int(cfg.get("clock_skew_seconds", 0))
     return int(ts_unix + skew)
 
 # -------------------- Posting sinks --------------------
@@ -311,10 +306,9 @@ def capi_post(server_events, cfg):
     if not CAPI_URL or not ACCESS_TOKEN:
         return {"skipped": True, "reason": "missing_capi_config"}
 
-    lat = int(chaos(cfg, "net_capi_latency_ms", 0) or 0)
+    lat = int(cfg.get("net_capi_latency_ms", 0))
     if lat > 0: time.sleep(lat/1000.0)
-    err_rate = float(chaos(cfg, "net_capi_error_rate", 0.0) or 0.0)
-    if rand_uniform(0.0, 1.0) < err_rate:
+    if rand_uniform(0.0, 1.0) < float(cfg.get("net_capi_error_rate", 0.0)):
         class Dummy: status_code=503; text="Simulated upstream error"
         raise requests.HTTPError("503 Simulated", response=Dummy())
 
@@ -391,9 +385,30 @@ def contents_subtotal(contents):
         except Exception: pass
     return round(s,2)
 
+def _compose_user_data(cfg):
+    ud = {
+        "external_id": sha256_norm(cfg.get("seed","") or "anon"),  # stable anon id
+    }
+    # client ip / ua
+    if cfg.get("send_client_ip"):
+        ud["client_ip_address"] = request.remote_addr if has_request_context() else "127.0.0.1"
+    if cfg.get("send_client_ua"):
+        ud["client_user_agent"] = (request.headers.get("User-Agent","AutoRunner/1.0") if has_request_context()
+                                   else "AutoRunner/1.0")
+    # hashed email
+    if cfg.get("send_em"):
+        em_raw = (cfg.get("user_email") or "").strip().lower()
+        if em_raw:
+            ud["em"] = [sha256_norm(em_raw)]
+    # browser ids
+    if cfg.get("send_fbp") and (cfg.get("fbp") or "").strip():
+        ud["fbp"] = cfg.get("fbp").strip()
+    if cfg.get("send_fbc") and (cfg.get("fbc") or "").strip():
+        ud["fbc"] = cfg.get("fbc").strip()
+    return ud
+
 def map_sim_event_to_capi(e, cfg):
     et   = e.get("event_type")
-    sess = e.get("user", {})
     ctx  = e.get("context", {})
 
     cur = ctx.get("currency","USD")
@@ -408,20 +423,12 @@ def map_sim_event_to_capi(e, cfg):
         page = "/checkout"
     event_source_url = BASE_URL.rstrip("/") + page
 
-    client_ip = request.remote_addr if has_request_context() else "127.0.0.1"
-    user_agent = (request.headers.get("User-Agent","AutoRunner/1.0") if has_request_context()
-                  else "AutoRunner/1.0")
-
     base = {
         "event_time": ts_unix,
         "event_id": e.get("event_id"),
         "action_source": "website",
         "event_source_url": event_source_url,
-        "user_data": {
-            "external_id": sha256_norm(sess.get("user_id","")),
-            "client_ip_address": client_ip,
-            "client_user_agent": user_agent
-        }
+        "user_data": _compose_user_data(cfg)
     }
 
     out = []
@@ -479,7 +486,7 @@ def map_sim_event_to_capi(e, cfg):
         cd = _schema_mutations(cd, cfg)
         out = [{**base, "event_name":"ReturnInitiated", "custom_data": cd}]
 
-    # apply bad-data toggles (not gated by chaos; these are explicit)
+    # apply bad-data toggles
     for ev in out:
         if cfg.get("null_event_id"):
             ev["event_id"] = None
@@ -529,7 +536,7 @@ def banner_html():
 PAGE_HTML_HEAD = """<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Store Simulator</title>
+<title>Demo Store — Simulator</title>
 <style>
 :root { --bd:#223040; --fg:#e6eef7; --muted:#9fb3c8; --ok:#28c76f; --err:#ff5c5c; --bg:#0b0f14; --panel:#0e1520; }
 * { box-sizing:border-box }
@@ -549,7 +556,6 @@ textarea { width:100%; min-height:90px; }
 .btn .tick, .btn .x { position:absolute; right:8px; top:50%; transform:translateY(-50%) scale(0.8); opacity:0; transition:opacity .18s, transform .18s; }
 .btn .tick { color:var(--ok); } .btn .x { color:var(--err); }
 .btn .tick svg, .btn .x svg { width:18px; height:18px; }
-.btn[disabled] { opacity:0.7; cursor:not-allowed; }
 .table { width:100%; border-collapse:collapse; font-size:12px; }
 .table th, .table td { border-bottom:1px solid #183048; padding:6px 8px; vertical-align:top; }
 .badge { display:inline-block; border:1px solid var(--bd); padding:2px 8px; border-radius:999px; font-size:11px; color:var(--muted); }
@@ -559,26 +565,6 @@ pre { margin:0; white-space:pre-wrap; word-break:break-word; }
 code { color:#cbd9ff; }
 .warn { color:#ffcf6e }
 .flex { display:flex; gap:10px; }
-
-/* Pulsing status dot */
-.dot { width:10px; height:10px; border-radius:50%; background:var(--ok); box-shadow:0 0 0 0 rgba(40,199,111,0.5); animation:pulse 1.5s infinite; display:inline-block; }
-.dot.hidden { display:none; }
-@keyframes pulse {
-  0% { box-shadow:0 0 0 0 rgba(40,199,111,0.6); }
-  70%{ box-shadow:0 0 0 10px rgba(40,199,111,0); }
-  100%{ box-shadow:0 0 0 0 rgba(40,199,111,0); }
-}
-
-/* Simple toggle */
-.switch { position:relative; display:inline-block; width:44px; height:24px; }
-.switch input { display:none; }
-.slider { position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background:#3a4758; transition:.2s; border-radius:999px; }
-.slider:before { position:absolute; content:""; height:18px; width:18px; left:3px; top:3px; background:white; transition:.2s; border-radius:50%; }
-input:checked + .slider { background:#169b62; }
-input:checked + .slider:before { transform:translateX(20px); }
-
-/* Disabled panel overlay */
-.card.disabled { opacity:0.55; pointer-events:none; }
 </style>
 <script>
 function rid(){ return 'evt_' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
@@ -592,7 +578,7 @@ function copyTxt(t){ navigator.clipboard.writeText(t).catch(()=>{}); }
 PAGE_HTML_BODY_PREFIX = """
 </head><body>
 <div class="container">
-  <h1>Store Simulator <span class="small">v__APP_VERSION__</span></h1>
+  <h1>Demo Store Simulator <span class="small">v__APP_VERSION__</span></h1>
   __BANNERS__
   <div class="topbar">
     <span class="badge" id="badge_pixel">Pixel: ?</span>
@@ -617,7 +603,7 @@ PAGE_HTML_BODY_PREFIX = """
           <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
         </button>
         <button class="btn" onclick="sendInitiate(this)">InitiateCheckout
-          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
+          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
           <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
         </button>
         <button class="btn" onclick="sendPurchase(this)">Purchase
@@ -632,7 +618,7 @@ PAGE_HTML_BODY_PREFIX = """
       </div>
     </div>
 
-    <!-- Pixel Auto (browser-side) -->
+    <!-- NEW: Pixel Auto (browser-side) -->
     <div class="card">
       <h3>Pixel Auto (browser → Pixel)</h3>
       <p class="small">Automatically fires Meta Pixel events from the browser. Respects Enable Pixel, currency/price nulls, mismatch, and event-ID toggles.</p>
@@ -641,9 +627,15 @@ PAGE_HTML_BODY_PREFIX = """
         <input id="px_rps" type="number" step="0.1" min="0.1" value="0.5"/>
       </div>
       <div class="row">
-        <button id="pxStartBtn" class="btn" onclick="pixelAutoStart(this)">Start</button>
-        <button id="pxStopBtn" class="btn" onclick="pixelAutoStop(this)" disabled>Stop</button>
-        <span class="dot hidden" id="px_dot" aria-label="Pixel auto running"></span>
+        <button id="pxStartBtn" class="btn" onclick="pixelAutoStart(this)">
+          Start
+          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
+          <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
+        </button>
+        <button id="pxStopBtn" class="btn" onclick="pixelAutoStop(this)" disabled>
+          Stop
+          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
+        </button>
       </div>
       <p id="px_status" class="small">Stopped</p>
     </div>
@@ -655,9 +647,13 @@ PAGE_HTML_BODY_PREFIX = """
         <label>Sessions/sec</label><input id="rps" type="number" step="0.1" min="0.1" value="0.5"/>
       </div>
       <div class="row">
-        <button id="startBtn" class="btn" onclick="startAuto(this)">Start</button>
-        <button id="stopBtn" class="btn" onclick="stopAuto(this)">Stop</button>
-        <span class="dot hidden" id="sv_dot" aria-label="Server auto running"></span>
+        <button id="startBtn" class="btn" onclick="startAuto(this)">Start
+          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
+          <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
+        </button>
+        <button id="stopBtn" class="btn" onclick="stopAuto(this)">Stop
+          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
+        </button>
       </div>
       <p id="status" class="small">…</p>
       <div class="row small">
@@ -717,14 +713,21 @@ PAGE_HTML_BODY_PREFIX = """
       <div class="row"><label>Append PLTV</label><input id="append_pltv" type="checkbox" checked/></div>
       <div class="row"><label>PLTV min</label><input id="pltv_min" type="number" step="0.01" min="0" value="120"/></div>
       <div class="row"><label>PLTV max</label><input id="pltv_max" type="number" step="0.01" min="0" value="600"/></div>
+
+      <hr/>
+      <h3 style="margin-top:8px;">CAPI User Data (toggles)</h3>
+      <div class="row"><label class="small">Send Hashed Email (em)</label><input id="send_em" type="checkbox"/></div>
+      <div class="row"><label class="small">User Email (for hashing)</label><input id="user_email" style="width:260px" placeholder="user@example.com"/></div>
+      <div class="row"><label class="small">Send Client IP</label><input id="send_client_ip" type="checkbox"/></div>
+      <div class="row"><label class="small">Send User Agent</label><input id="send_client_ua" type="checkbox"/></div>
+      <div class="row"><label class="small">Send fbp</label><input id="send_fbp" type="checkbox"/></div>
+      <div class="row"><label class="small">Send fbc</label><input id="send_fbc" type="checkbox"/></div>
+      <div class="row"><label class="small">Detected fbp:</label><span id="fbp_val" class="small">…</span></div>
+      <div class="row"><label class="small">Detected fbc:</label><span id="fbc_val" class="small">…</span></div>
     </div>
 
-    <div class="card" id="chaos_card">
-      <h3>Discrepancy &amp; Chaos</h3>
-      <div class="row">
-        <label class="small">Enable</label>
-        <label class="switch"><input id="chaos_enabled" type="checkbox"><span class="slider"></span></label>
-      </div>
+    <div class="card">
+      <h3>Discrepancy & Chaos</h3>
       <div class="row"><label>Mismatch value ±%</label><input id="mismatch_value_pct" type="number" step="0.01" min="0" max="1" value="0"/></div>
       <div class="row"><label>Mismatch currency</label>
         <select id="mismatch_currency"><option>NONE</option><option>PIXEL</option><option>CAPI</option></select>
@@ -751,19 +754,12 @@ PAGE_HTML_BODY_PREFIX = """
     </div>
 
     <div class="card">
-      <h3>Sinks &amp; Tools</h3>
+      <h3>Sinks & Tools</h3>
       <div class="row"><label>Webhook sink</label><input id="enable_webhook" type="checkbox"/></div>
       <div class="row"><label>GA4 sink</label><input id="enable_ga4" type="checkbox"/></div>
       <div class="row"><button class="btn" onclick="saveConfig(this)">Save Controls</button></div>
       <p class="small">File sink: __FILE_SINK_LABEL__</p>
       <div class="row"><button class="btn" onclick="downloadReplay()">Download Replay Bundle</button></div>
-    </div>
-
-    <div class="card">
-      <h3>Self Test</h3>
-      <p class="small">Checks env, then sends a tiny test event via CAPI (uses Test Event Code if set).</p>
-      <div class="row"><button class="btn" onclick="runSelfTest(this)">Run Self Test</button></div>
-      <pre id="selftest_out" class="small" style="background:#0b1320; border:1px solid var(--bd); border-radius:10px; padding:8px; height:120px; overflow:auto;">(no output)</pre>
     </div>
 
     <div class="card" style="grid-column:1/-1;">
@@ -840,8 +836,7 @@ function attachMarginPltv(payload, price, cfg){
 function currentCurrency(channel){
   const mode = (document.getElementById('currency_override').value || 'AUTO').toUpperCase();
   const bad = readBadToggles();
-  const chaosOn = document.getElementById('chaos_enabled').checked;
-  const mm = chaosOn ? (document.getElementById('mismatch_currency').value||'NONE').toUpperCase() : 'NONE';
+  const mm = (document.getElementById('mismatch_currency').value||'NONE').toUpperCase();
   if (mm==='PIXEL' && channel==='pixel') return null;
   if (mode==='NULL') return null;
   if (bad.null_currency) return null;
@@ -858,33 +853,59 @@ function updatePreview(){
 }
 
 // ----- Discrepancy helpers -----
-function chaosOn(){ return document.getElementById('chaos_enabled').checked; }
 function maybeMismatchValue(val){
-  if (!chaosOn()) return val;
   const pct = parseFloat(document.getElementById('mismatch_value_pct').value||'0');
   if (!pct || !val) return val;
   const delta = val * pct;
   return Math.round((val + randBetween(-delta, delta))*100)/100;
 }
 function maybeDesyncEventId(eid){
-  if (!chaosOn()) return eid;
   return document.getElementById('desync_event_id').checked ? eid + '_px' : eid;
 }
 function maybeDropPixel(){
-  if (!chaosOn()) return false;
   const n = parseInt(document.getElementById('drop_pixel_every_n').value||'0',10);
   if (!n) return false;
   window.__pxCount = (window.__pxCount||0) + 1;
   return window.__pxCount % n === 0;
 }
 function maybeDupePixelId(eid){
-  if (!chaosOn()) return eid;
   const n = parseInt(document.getElementById('duplicate_event_id_n').value||'0',10);
   if (!n) return eid;
   window.__dupeIdx = (window.__dupeIdx||0) + 1;
   if (window.__dupeIdx % n === 0) return (window.__lastPxEid || eid);
   window.__lastPxEid = eid;
   return eid;
+}
+
+// ----- fbp/fbc detection & post -----
+function getCookie(name){
+  const m = document.cookie.match(new RegExp('(?:^|; )' + name.replace(/([.$?*|{}()\\[\\]\\\\\\/\\+^])/g, '\\\\$1') + '=([^;]*)'));
+  return m ? decodeURIComponent(m[1]) : '';
+}
+function setCookie(name, value, days){
+  const d = new Date();
+  d.setTime(d.getTime() + (days*24*60*60*1000));
+  document.cookie = name + '=' + encodeURIComponent(value) + '; path=/; expires=' + d.toUTCString();
+}
+function getParam(name){
+  const u = new URL(window.location.href);
+  return u.searchParams.get(name) || '';
+}
+async function detectFbpFbc(){
+  // build _fbc from fbclid if present
+  const fbclid = getParam('fbclid');
+  if (fbclid){
+    const ts = Math.floor(Date.now()/1000);
+    const fbc = 'fb.1.' + ts + '.' + fbclid;
+    setCookie('_fbc', fbc, 180);
+  }
+  const fbp = getCookie('_fbp') || '';
+  const fbc = getCookie('_fbc') || '';
+  document.getElementById('fbp_val').textContent = fbp || '(none)';
+  document.getElementById('fbc_val').textContent = fbc || '(none)';
+  try{
+    await fetch('/client/fbids', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({fbp, fbc})});
+  }catch(e){}
 }
 
 // ----- Pixel send & server telemetry -----
@@ -972,7 +993,6 @@ function pixelAutoStart(btn){
   document.getElementById('px_status').textContent = 'Running at ' + (Math.round((1000/interval)*100)/100) + ' events/sec';
   document.getElementById('pxStartBtn').disabled = true;
   document.getElementById('pxStopBtn').disabled = false;
-  document.getElementById('px_dot').classList.remove('hidden');
   flashIcon(btn, true);
 }
 
@@ -982,7 +1002,6 @@ function pixelAutoStop(btn){
   document.getElementById('px_status').textContent = 'Stopped';
   document.getElementById('pxStartBtn').disabled = false;
   document.getElementById('pxStopBtn').disabled = true;
-  document.getElementById('px_dot').classList.add('hidden');
   flashIcon(btn, true);
 }
 
@@ -991,7 +1010,6 @@ function pxRefreshStatus(){
   document.getElementById('px_status').textContent = running ? 'Running' : 'Stopped';
   document.getElementById('pxStartBtn').disabled = running;
   document.getElementById('pxStopBtn').disabled = !running;
-  document.getElementById('px_dot').classList.toggle('hidden', !running);
 }
 
 // ----- Auto stream controls (server) -----
@@ -1002,7 +1020,6 @@ async function refreshStatus(){
     document.getElementById('startBtn').disabled = j.running;
     document.getElementById('stopBtn').disabled = !j.running;
     if (j.running) document.getElementById('rps').value = j.rps;
-    document.getElementById('sv_dot').classList.toggle('hidden', !j.running);
   } catch(e){ document.getElementById('status').textContent = 'Unknown'; }
 }
 async function startAuto(btn){
@@ -1048,13 +1065,6 @@ async function resetDefaults(btn){
 }
 
 // ----- Config I/O -----
-function setChaosCardDisabled(disabled){
-  const card = document.getElementById('chaos_card');
-  card.classList.toggle('disabled', disabled);
-  // Disable all inputs in card except the main toggle
-  const inputs = card.querySelectorAll('input, select');
-  inputs.forEach(el => { if (el.id !== 'chaos_enabled') el.disabled = disabled; });
-}
 async function loadConfig(){
   const cfg = await fetchJSON('/auto/config');
   ENABLE_PIXEL = !!cfg.enable_pixel;
@@ -1102,9 +1112,14 @@ async function loadConfig(){
   document.getElementById('kill_Purchase').checked = !!(cfg.kill_event_types||{})["Purchase"];
   document.getElementById('enable_webhook').checked = !!cfg.enable_webhook;
   document.getElementById('enable_ga4').checked = !!cfg.enable_ga4;
-  // Chaos toggle
-  document.getElementById('chaos_enabled').checked = !!cfg.chaos_enabled;
-  setChaosCardDisabled(!cfg.chaos_enabled);
+
+  // NEW user_data toggles
+  document.getElementById('send_em').checked = !!cfg.send_em;
+  document.getElementById('user_email').value = cfg.user_email || '';
+  document.getElementById('send_client_ip').checked = !!cfg.send_client_ip;
+  document.getElementById('send_client_ua').checked = !!cfg.send_client_ua;
+  document.getElementById('send_fbp').checked = !!cfg.send_fbp;
+  document.getElementById('send_fbc').checked = !!cfg.send_fbc;
 
   updateBadges(); updatePreview();
 }
@@ -1132,7 +1147,6 @@ async function saveConfig(btn){
     append_pltv: document.getElementById('append_pltv').checked,
     pltv_min: parseFloat(document.getElementById('pltv_min').value||'120'),
     pltv_max: parseFloat(document.getElementById('pltv_max').value||'600'),
-    chaos_enabled: document.getElementById('chaos_enabled').checked,
     mismatch_value_pct: parseFloat(document.getElementById('mismatch_value_pct').value||'0'),
     mismatch_currency: document.getElementById('mismatch_currency').value||'NONE',
     desync_event_id: document.getElementById('desync_event_id').checked,
@@ -1155,12 +1169,19 @@ async function saveConfig(btn){
     },
     enable_webhook: document.getElementById('enable_webhook').checked,
     enable_ga4: document.getElementById('enable_ga4').checked,
+
+    // NEW user_data toggles
+    send_em: document.getElementById('send_em').checked,
+    user_email: document.getElementById('user_email').value||'',
+    send_client_ip: document.getElementById('send_client_ip').checked,
+    send_client_ua: document.getElementById('send_client_ua').checked,
+    send_fbp: document.getElementById('send_fbp').checked,
+    send_fbc: document.getElementById('send_fbc').checked,
   };
   const ok = await fetchOK('/auto/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   flashIcon(btn, ok);
   if (ok) setTimeout(refreshStatus, 250);
   updateBadges(); updatePreview();
-  setChaosCardDisabled(!body.chaos_enabled);
 }
 function updateBadges(){
   fetchJSON('/auto/config').then(cfg => {
@@ -1239,25 +1260,11 @@ async function downloadReplay(){
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'replay_bundle.json'; a.click();
 }
 
-// ----- Self Test -----
-async function runSelfTest(btn){
-  const out = document.getElementById('selftest_out');
-  out.textContent = 'Running...';
-  try{
-    const r = await fetchJSON('/selftest/run', {method:'POST'});
-    out.textContent = JSON.stringify(r, null, 2);
-  }catch(e){
-    out.textContent = 'Error: ' + e;
-  }
-}
-
 // ----- Init -----
 window.addEventListener('load', async () => {
   await loadConfig(); updatePreview(); refreshStatus(); pollMetrics(); refreshConsole();
   pxRefreshStatus(); // initialize Pixel Auto controls
-  document.getElementById('chaos_enabled').addEventListener('change', ()=>{
-    setChaosCardDisabled(!document.getElementById('chaos_enabled').checked);
-  });
+  await detectFbpFbc(); // detect & post fbp/fbc
   if (document.getElementById('enable_pixel').checked) { try { fbq('track','PageView'); } catch(e){} }
 });
 </script>
@@ -1288,6 +1295,7 @@ def home():
 # -------------------- Metrics endpoints --------------------
 @app.post("/metrics/pixel")
 def metrics_pixel():
+    """Client pings here when it fires a Pixel event so we can power dedup & diff."""
     try:
         body = request.get_json(force=True) or {}
     except Exception:
@@ -1443,14 +1451,11 @@ def _send_one_through_sinks(sim_evt, cfg):
     ga4_events  = map_sim_event_to_ga4(sim_evt, cfg) if cfg.get("enable_ga4") else []
 
     kill = cfg.get("kill_event_types", {})
-    if not cfg.get("chaos_enabled", True):
-        # when chaos is off, kill switches are considered off
-        kill = {"PageView": False, "ViewContent": False, "AddToCart": False, "InitiateCheckout": False, "Purchase": False, "ReturnInitiated": False}
     for ev in capi_events:
         if kill.get(ev.get("event_name",""), False):
             return
 
-    lag = float(chaos(cfg, "lag_capi_seconds", 0.0) or 0.0)
+    lag = float(cfg.get("lag_capi_seconds", 0.0))
     if lag > 0: time.sleep(max(0.0, lag))
 
     # Post CAPI
@@ -1572,9 +1577,10 @@ def auto_status():
         rps = round(CONFIG["rps"], 2)
     return jsonify({"ok": True, "running": running, "rps": rps})
 
-# -------------------- /ingest forwarder --------------------
+# -------------------- /ingest forwarder (client → server → CAPI) --------------------
 @app.post("/ingest")
 def ingest():
+    """Accept a single sim event and forward to CAPI/sinks."""
     try:
         sim_event = request.get_json(force=True)
     except Exception:
@@ -1585,6 +1591,20 @@ def ingest():
         return {"ok": True}
     except Exception as e:
         return {"ok": False, "error": str(e)}, 500
+
+# -------------------- Client fb ids (fbp/fbc) --------------------
+@app.post("/client/fbids")
+def client_fbids():
+    try:
+        body = request.get_json(force=True) or {}
+    except Exception:
+        return {"ok": False}, 400
+    fbp = (body.get("fbp") or "").strip()
+    fbc = (body.get("fbc") or "").strip()
+    with CONFIG_LOCK:
+        if fbp: CONFIG["fbp"] = fbp
+        if fbc: CONFIG["fbc"] = fbc
+    return {"ok": True}
 
 # -------------------- Config endpoints --------------------
 @app.route("/auto/config", methods=["GET", "POST"])
@@ -1600,7 +1620,8 @@ def auto_config():
 
     with CONFIG_LOCK:
         # master
-        for k in ("enable_pixel","enable_capi","enable_webhook","enable_ga4","append_margin","append_pltv","null_price","null_currency","null_event_id","desync_event_id","schema_remove_contents","schema_empty_arrays","schema_str_numbers","schema_unknown_fields","chaos_enabled"):
+        for k in ("enable_pixel","enable_capi","enable_webhook","enable_ga4","append_margin","append_pltv","null_price","null_currency","null_event_id","desync_event_id","schema_remove_contents","schema_empty_arrays","schema_str_numbers","schema_unknown_fields",
+                  "send_em","send_client_ip","send_client_ua","send_fbp","send_fbc"):
             if k in body: CONFIG[k] = to_bool(body[k], CONFIG.get(k,False))
         # traffic
         if "rps" in body: CONFIG["rps"] = clampf(body["rps"], 0.1, 10.0, CONFIG["rps"])
@@ -1651,6 +1672,12 @@ def auto_config():
             for name in ("PageView","ViewContent","AddToCart","InitiateCheckout","Purchase","ReturnInitiated"):
                 keep[name] = to_bool(d.get(name, CONFIG["kill_event_types"].get(name, False)))
             CONFIG["kill_event_types"] = keep
+
+        # NEW: values
+        if "user_email" in body: CONFIG["user_email"] = str(body["user_email"] or "")
+        # fbp/fbc are primarily set via /client/fbids; allow override if present
+        if "fbp" in body: CONFIG["fbp"] = str(body["fbp"] or "")
+        if "fbc" in body: CONFIG["fbc"] = str(body["fbc"] or "")
 
     return jsonify({"ok": True, "config": get_cfg_snapshot()})
 
@@ -1705,6 +1732,7 @@ def scenario_run():
 # -------------------- Replay export --------------------
 @app.get("/replay/export")
 def replay_export():
+    """Return a replayable bundle: last N capi events with timestamps."""
     with METRICS_LOCK:
         items = [e for e in list(EVENT_LOG) if e.get("channel")=="capi"][:200]
     bundle = {
@@ -1713,35 +1741,6 @@ def replay_export():
         "events": [{"event_name": e.get("event_name"), "sent": e.get("sent"), "ts": e.get("ts")} for e in items]
     }
     return jsonify(bundle)
-
-# -------------------- Self Test --------------------
-@app.post("/selftest/run")
-def selftest_run():
-    info = {"capi_ready": bool(CAPI_URL and ACCESS_TOKEN), "pixel_ready": bool(PIXEL_ID), "ga4_ready": bool(GA4_URL)}
-    results = {"ok": True, "info": info}
-    # send a tiny server-side Purchase to Test Events if possible
-    if info["capi_ready"]:
-        try:
-            evt = {
-                "event_name":"Purchase",
-                "event_time": int(time.time()),
-                "event_id": "selftest_"+_uid()[:12],
-                "action_source": "website",
-                "event_source_url": BASE_URL,
-                "user_data": {"external_id": sha256_norm("selftest_user"), "client_ip_address":"127.0.0.1", "client_user_agent":"SelfTest/1.0"},
-                "custom_data": {"currency":"USD", "value": 1.23}
-            }
-            payload = {"data":[evt]}
-            if TEST_EVENT_CODE:
-                payload["test_event_code"] = TEST_EVENT_CODE
-            r = requests.post(CAPI_URL, params={"access_token": ACCESS_TOKEN}, json=payload, timeout=10)
-            results["capi_status"] = r.status_code
-            results["capi_text"] = r.text[:400]
-            results["ok"] = (200 <= r.status_code < 300)
-        except Exception as e:
-            results["ok"] = False
-            results["error"] = str(e)
-    return jsonify(results)
 
 # -------------------- Health & version --------------------
 @app.get("/healthz")
