@@ -1,173 +1,95 @@
 #!/usr/bin/env python3
-# E-commerce Simulator v2.1.6
-# Changes in 2.1.6:
-# - Title: remove "Demo" → "Store Simulator"
-# - Pulsing dot indicators for Pixel Auto and Server Auto start/stop
-# - Discrepancy & Chaos: real on/off toggle that keeps header visible; inputs disabled when off
-# - Self-test buttons stay
-# - "Share event_id to CAPI" toggle: forwards pixel telemetry payload to CAPI with same event_id for dedup
-# - /chaos/reset endpoint to zero-out chaos/discrepancy knobs
 import os, json, hashlib, time, threading, uuid, math, random
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from collections import deque, defaultdict
 from typing import Any, Dict, List
 from flask import Flask, request, Response, jsonify, has_request_context
 import requests
 from dotenv import load_dotenv
 
-# -------------------- Config & constants --------------------
 load_dotenv()
-
-PIXEL_ID        = os.getenv("PIXEL_ID", "")
-ACCESS_TOKEN    = os.getenv("ACCESS_TOKEN", "")
-TEST_EVENT_CODE = os.getenv("TEST_EVENT_CODE", "")
-BASE_URL        = os.getenv("BASE_URL", "http://127.0.0.1:5000")
-GRAPH_VER       = os.getenv("GRAPH_VER", "v20.0")
-CAPI_URL        = f"https://graph.facebook.com/{GRAPH_VER}/{PIXEL_ID}/events" if PIXEL_ID else None
-
-GA4_MEASUREMENT_ID = os.getenv("GA4_MEASUREMENT_ID", "")
-GA4_API_SECRET     = os.getenv("GA4_API_SECRET", "")
-GA4_URL            = f"https://www.google-analytics.com/mp/collect?measurement_id={GA4_MEASUREMENT_ID}&api_secret={GA4_API_SECRET}" if (GA4_MEASUREMENT_ID and GA4_API_SECRET) else None
-
-WEBHOOK_URL     = os.getenv("WEBHOOK_URL", "")
+PIXEL_ID = os.getenv("PIXEL_ID","")
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN","")
+TEST_EVENT_CODE_ENV = os.getenv("TEST_EVENT_CODE","")
+BASE_URL = os.getenv("BASE_URL","http://127.0.0.1:5000")
+GRAPH_VER = os.getenv("GRAPH_VER","v20.0")
+CAPI_URL_BASE = f"https://graph.facebook.com/{GRAPH_VER}"
+GA4_MEASUREMENT_ID = os.getenv("GA4_MEASUREMENT_ID","")
+GA4_API_SECRET = os.getenv("GA4_API_SECRET","")
+GA4_URL = f"https://www.google-analytics.com/mp/collect?measurement_id={GA4_MEASUREMENT_ID}&api_secret={GA4_API_SECRET}" if (GA4_MEASUREMENT_ID and GA4_API_SECRET) else None
+WEBHOOK_URL = os.getenv("WEBHOOK_URL","")
 try:
     WEBHOOK_HEADERS = json.loads(os.getenv("WEBHOOK_HEADERS","{}") or "{}")
 except Exception:
     WEBHOOK_HEADERS = {}
-
-FILE_SINK_PATH  = os.getenv("FILE_SINK_PATH", "")  # e.g. "events.ndjson"
-
-APP_VERSION = "2.1.6"
-
+FILE_SINK_PATH = os.getenv("FILE_SINK_PATH","")
+APP_VERSION = "2.2.0"
 app = Flask(__name__)
 
-# -------------------- Thread-safe runtime config --------------------
 CONFIG_LOCK = threading.Lock()
 CONFIG: Dict[str, Any] = {
-    # traffic/simulator
     "rps": 0.5,
-    "p_add_to_cart": 0.35,
-    "p_begin_checkout": 0.70,
-    "p_purchase": 0.70,
-
-    # catalog & pricing
-    "product_catalog_size": 200,
-    "price_min": 10.0,
-    "price_max": 120.0,
-
-    # currency control
-    "currency_override": "AUTO",  # AUTO | NULL | USD/EUR/...
-
-    # order economics
-    "free_shipping_threshold": 75.0,
-    "shipping_options": [4.99, 6.99, 9.99],
-    "tax_rate": 0.08,
-
-    # signals master switches
-    "enable_pixel": True,
-    "enable_capi": True,
-
-    # bad-data toggles
-    "null_price": False,
-    "null_currency": False,
-    "null_event_id": False,
-
-    # margin + PLTV
-    "append_margin": True,
-    "cost_pct_min": 0.40,     # fraction 0..1
-    "cost_pct_max": 0.80,     # fraction 0..1
-    "append_pltv": True,
-    "pltv_min": 120.0,
-    "pltv_max": 600.0,
-
-    # seeded randomness
-    "seed": "",  # when set, RNG is seeded
-
-    # discrepancy toggles
-    "mismatch_value_pct": 0.0,        # e.g. 0.15 -> ±15% applied to Pixel when >0
-    "mismatch_currency": "NONE",      # NONE | PIXEL | CAPI
-    "desync_event_id": False,         # pixel uses a different event_id than capi
-    "duplicate_event_id_n": 0,        # 0 disables; else duplicate every Nth Pixel event_id
-    "drop_pixel_every_n": 0,          # drop every Nth Pixel event
-    "lag_capi_seconds": 0.0,          # delay before sending to CAPI (simulate network lag)
-
-    # chaos
-    "net_capi_latency_ms": 0,         # artificial latency (per request)
-    "net_capi_error_rate": 0.0,       # 0..1 force HTTP error (simulate)
-    "schema_remove_contents": False,
-    "schema_empty_arrays": False,
-    "schema_str_numbers": False,      # send numbers as strings
-    "schema_unknown_fields": False,
-    "clock_skew_seconds": 0,          # ± seconds added to event_time
-    "kill_event_types": {             # master kill per type
-        "PageView": False, "ViewContent": False, "AddToCart": False,
-        "InitiateCheckout": False, "Purchase": False, "ReturnInitiated": False
-    },
-    "chaos_enabled": True,            # NEW: gate(all chaos inputs). UI keeps toggle visible.
-
-    # sinks
-    "enable_webhook": False,
-    "enable_ga4": False,
-
-    # presets name (display only)
-    "active_preset": "Default",
-
-    # NEW: share pixel event_id to CAPI (forward telemetry payload)
-    "share_event_id_to_capi": False,
+    "p_add_to_cart": 0.35, "p_begin_checkout": 0.70, "p_purchase": 0.70,
+    "product_catalog_size": 200, "price_min": 10.0, "price_max": 120.0,
+    "currency_override": "AUTO",
+    "free_shipping_threshold": 75.0, "shipping_options": [4.99,6.99,9.99], "tax_rate": 0.08,
+    "enable_pixel": True, "enable_capi": True,
+    "null_price": False, "null_currency": False, "null_event_id": False,
+    "append_margin": True, "cost_pct_min": 0.40, "cost_pct_max": 0.80,
+    "append_pltv": True, "pltv_min": 120.0, "pltv_max": 600.0,
+    "seed": "",
+    "mismatch_value_pct": 0.0, "mismatch_currency": "NONE", "desync_event_id": False,
+    "duplicate_event_id_n": 0, "drop_pixel_every_n": 0, "lag_capi_seconds": 0.0,
+    "net_capi_latency_ms": 0, "net_capi_error_rate": 0.0,
+    "schema_remove_contents": False, "schema_empty_arrays": False, "schema_str_numbers": False, "schema_unknown_fields": False,
+    "clock_skew_seconds": 0,
+    "kill_event_types": {"PageView":False,"ViewContent":False,"AddToCart":False,"InitiateCheckout":False,"Purchase":False,"ReturnInitiated":False,"AppendValue":False},
+    "enable_webhook": False, "enable_ga4": False,
+    "user_signal_em": False, "user_signal_ip": False, "user_signal_fbc": False, "user_signal_fbp": False,
+    "user_default_email":"", "user_default_fbc":"", "user_default_fbp":"",
+    "test_event_code": TEST_EVENT_CODE_ENV,
+    "isolation_appendvalue_only": False,
+    "active_preset": "Default"
 }
-
-# seeded RNG
 _rng = random.Random()
 def reseed():
     with CONFIG_LOCK:
         seed = (CONFIG.get("seed") or "").strip()
-    if seed:
-        _rng.seed(seed)
-    else:
-        _rng.seed()  # system time
+    _rng.seed(seed if seed else None)
 reseed()
 
-# -------------------- Telemetry & storage --------------------
-EVENT_LOG_MAX = 800
-EVENT_LOG: deque = deque(maxlen=EVENT_LOG_MAX)  # dicts: {ts, channel, event_name, intended, sent, response, ok, event_id, diff}
+EVENT_LOG_MAX = 1200
+EVENT_LOG: deque = deque(maxlen=EVENT_LOG_MAX)
 COUNTS = defaultdict(int)
 DEDUP = {"pixel_ids": set(), "capi_ids": set(), "matched": 0, "pixel_only": 0, "capi_only": 0}
 METRICS_LOCK = threading.Lock()
+LAST_USERDATA = {"fbc":"", "fbp":""}
 
 def _log_event(entry: Dict[str,Any]):
     with METRICS_LOCK:
         EVENT_LOG.appendleft(entry)
-        ch = entry.get("channel","")
-        name = entry.get("event_name","")
-        ok = entry.get("ok", False)
-        COUNTS[f"sent_{ch}"] += 1
-        COUNTS[f"sent_{ch}_{name}"] += 1
-        if not ok:
-            COUNTS["errors"] += 1
-        eid = (entry.get("event_id") or "")
+        ch = entry.get("channel",""); name = entry.get("event_name",""); ok = entry.get("ok", False)
+        COUNTS[f"sent_{ch}"] += 1; COUNTS[f"sent_{ch}_{name}"] += 1
+        if not ok: COUNTS["errors"] += 1
+        eid = entry.get("event_id") or ""
         if eid:
-            if ch == "pixel":
-                DEDUP["pixel_ids"].add(eid)
-            elif ch == "capi":
-                DEDUP["capi_ids"].add(eid)
+            if ch == "pixel": DEDUP["pixel_ids"].add(eid)
+            elif ch == "capi": DEDUP["capi_ids"].add(eid)
             common = DEDUP["pixel_ids"].intersection(DEDUP["capi_ids"])
             DEDUP["matched"] = len(common)
             DEDUP["pixel_only"] = len(DEDUP["pixel_ids"] - common)
-            DEDUP["capi_only"]  = len(DEDUP["capi_ids"] - common)
+            DEDUP["capi_only"] = len(DEDUP["capi_ids"] - common)
 
 def _ndjson_append(row: Dict[str,Any]):
-    if not FILE_SINK_PATH:
-        return
+    if not FILE_SINK_PATH: return
     try:
-        with open(FILE_SINK_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
+        with open(FILE_SINK_PATH,'a',encoding='utf-8') as f:
+            f.write(json.dumps(row, ensure_ascii=False)+'\n')
+    except Exception: pass
 
-# -------------------- Utils --------------------
 def sha256_norm(s):
-    norm = (s or "").strip().lower()
-    return hashlib.sha256(norm.encode("utf-8")).hexdigest()
+    norm = (s or '').strip().lower()
+    return hashlib.sha256(norm.encode('utf-8')).hexdigest()
 
 def iso_to_unix(ts_iso):
     dt = datetime.fromisoformat(ts_iso.replace("Z","+00:00"))
@@ -175,7 +97,7 @@ def iso_to_unix(ts_iso):
 
 def get_cfg_snapshot():
     with CONFIG_LOCK:
-        return json.loads(json.dumps(CONFIG))  # deep copy
+        return json.loads(json.dumps(CONFIG))
 
 def clampf(v, lo, hi, default):
     try: x = float(v)
@@ -188,179 +110,72 @@ def clampp(v, lo, hi, default):
     return max(lo, min(hi, x))
 
 def to_bool(v, default=False):
-    if isinstance(v, bool): return v
-    if isinstance(v, (int,float)): return v != 0
-    if isinstance(v, str): return v.strip().lower() in ("1","true","t","yes","y","on")
+    if isinstance(v,bool): return v
+    if isinstance(v,(int,float)): return v != 0
+    if isinstance(v,str): return v.strip().lower() in ('1','true','t','yes','y','on')
     return default
 
-def rand_choice(seq):
-    return _rng.choice(seq)
-
-def rand_uniform(a,b):
+def rand_choice(seq): return _rng.choice(seq)
+def rand_uniform(a,b): 
     lo, hi = (a,b) if a <= b else (b,a)
-    return _rng.random() * (hi - lo) + lo
+    return _rng.random()*(hi-lo)+lo
+def rand_triangular(low,high,mode=None):
+    if mode is None: mode=(low+high)/2
+    u=_rng.random(); c=(mode-low)/(high-low)
+    if u < c: return low + ((u*(high-low)*(mode-low))**0.5)
+    else: return high - (((1-u)*(high-low)*(high-mode))**0.5)
 
-def rand_triangular(low, high, mode=None):
-    """Triangular distribution for prices."""
-    if mode is None:
-        mode = (low + high) / 2
-    u = _rng.random()
-    c = (mode - low) / (high - low)
-    if u < c:
-        return low + math.sqrt(u * (high - low) * (mode - low))
-    else:
-        return high - math.sqrt((1 - u) * (high - low) * (high - mode))
+def now_iso(): return datetime.now(tz=timezone.utc).isoformat()
 
-def now_iso():
-    return datetime.now(tz=timezone.utc).isoformat()
-
-# -------------------- Economics helpers --------------------
+# economics
 def _rand_cost(price, cfg):
-    try:
-        p = float(price)
-    except Exception:
-        return None
-    lo = max(0.0, float(cfg.get("cost_pct_min", 0.4)))
-    hi = max(lo, float(cfg.get("cost_pct_max", 0.8)))
+    try: p = float(price)
+    except Exception: return None
+    lo = max(0.0, float(cfg.get('cost_pct_min',0.4)))
+    hi = max(lo, float(cfg.get('cost_pct_max',0.8)))
     pct = rand_uniform(lo, hi)
-    return max(0.0, round(p * pct, 2))
+    return max(0.0, round(p*pct,2))
 
 def _margin_from_contents(contents, cfg):
-    total = 0.0
+    total=0.0
     for c in contents or []:
         try:
-            price = float(c.get("item_price"))
-            qty   = float(c.get("quantity", 1))
+            price=float(c.get('item_price')); qty=float(c.get('quantity',1))
         except Exception:
             continue
-        cost = _rand_cost(price, cfg)
-        if cost is None: 
-            continue
-        total += max(0.0, price - cost) * max(0.0, qty)
-    return round(total, 2)
+        cost=_rand_cost(price, cfg)
+        if cost is None: continue
+        total += max(0.0, price-cost)*max(0.0, qty)
+    return round(total,2)
 
 def append_margin_pltv(custom_data, cfg, single_price=None, contents=None):
-    if custom_data is None: custom_data = {}
-    if cfg.get("append_margin"):
-        margin_val = None
+    if custom_data is None: custom_data={}
+    if cfg.get('append_margin'):
+        margin_val=None
         if contents:
-            margin_val = _margin_from_contents(contents, cfg)
+            margin_val=_margin_from_contents(contents, cfg)
         elif single_price is not None:
             try:
-                price = float(single_price); cost = _rand_cost(price, cfg)
-                if cost is not None:
-                    margin_val = round(max(0.0, price - cost), 2)
-            except Exception:
-                pass
-        if margin_val is not None:
-            custom_data["margin"] = margin_val
-    if cfg.get("append_pltv"):
-        lo = float(cfg.get("pltv_min", 0.0))
-        hi = float(cfg.get("pltv_max", max(lo, 0.0)))
-        if hi < lo: hi = lo
-        custom_data["predicted_ltv"] = round(rand_uniform(lo, hi), 2)
+                price=float(single_price); cost=_rand_cost(price, cfg)
+                if cost is not None: margin_val=round(max(0.0, price-cost),2)
+            except Exception: pass
+        if margin_val is not None: custom_data['margin']=margin_val
+    if cfg.get('append_pltv'):
+        lo=float(cfg.get('pltv_min',0.0)); hi=float(cfg.get('pltv_max',max(lo,0.0)))
+        if hi<lo: hi=lo
+        custom_data['predicted_ltv']=round(rand_uniform(lo,hi),2)
     return custom_data
 
-# -------------------- Mapping sim → CAPI/GA4 helpers --------------------
-def _apply_currency_override(cur, cfg, channel="capi"):
-    ov = (cfg.get("currency_override") or "AUTO").upper()
-    mm = (cfg.get("mismatch_currency") or "NONE").upper()
-    if not cfg.get("chaos_enabled"):
-        mm = "NONE"
-    if mm == "PIXEL" and channel == "pixel":
-        return None if cur else "USD"
-    if mm == "CAPI" and channel == "capi":
-        return None if cur else "USD"
-    if ov == "NULL":
-        return None
-    elif ov != "AUTO":
-        return ov
-    return cur
-
-def _maybe_str_nums(obj, cfg):
-    if not (cfg.get("schema_str_numbers") and cfg.get("chaos_enabled")): return obj
-    def t(v):
-        if isinstance(v, (int, float)): return str(v)
-        if isinstance(v, list): return [t(x) for x in v]
-        if isinstance(v, dict): return {k: t(x) for k,x in v.items()}
-        return v
-    return t(obj)
-
-def _schema_mutations(custom_data, cfg):
-    if not custom_data: return custom_data
-    cd = dict(custom_data)
-    if cfg.get("chaos_enabled"):
-        if cfg.get("schema_remove_contents"):
-            cd.pop("contents", None)
-        if cfg.get("schema_empty_arrays"):
-            if "contents" in cd: cd["contents"] = []
-            if "content_ids" in cd: cd["content_ids"] = []
-        if cfg.get("schema_unknown_fields"):
-            cd["unknown_field_xyz"] = "foo"
-    return cd
-
-def _apply_clock_skew(ts_unix, cfg):
-    skew = int(cfg.get("clock_skew_seconds", 0) if cfg.get("chaos_enabled") else 0)
-    return int(ts_unix + skew)
-
-# -------------------- Posting sinks --------------------
-def capi_post(server_events, cfg):
-    if not cfg.get("enable_capi"):
-        return {"skipped": True, "reason": "enable_capi=false"}
-    if not CAPI_URL or not ACCESS_TOKEN:
-        return {"skipped": True, "reason": "missing_capi_config"}
-
-    lat = int(cfg.get("net_capi_latency_ms", 0) if cfg.get("chaos_enabled") else 0)
-    if lat > 0: time.sleep(lat/1000.0)
-    if cfg.get("chaos_enabled") and rand_uniform(0.0, 1.0) < float(cfg.get("net_capi_error_rate", 0.0)):
-        class Dummy: status_code=503; text="Simulated upstream error"
-        raise requests.HTTPError("503 Simulated", response=Dummy())
-
-    payload = {"data": server_events}
-    if TEST_EVENT_CODE:
-        payload["test_event_code"] = TEST_EVENT_CODE
-    r = requests.post(
-        CAPI_URL,
-        params={"access_token": ACCESS_TOKEN},
-        json=payload,
-        timeout=10
-    )
-    r.raise_for_status()
-    return r.json()
-
-def webhook_post(server_events, cfg):
-    if not cfg.get("enable_webhook"): return {"skipped": True}
-    if not WEBHOOK_URL: return {"skipped": True, "reason":"missing_webhook_url"}
-    try:
-        r = requests.post(WEBHOOK_URL, headers=WEBHOOK_HEADERS, json={"events": server_events}, timeout=10)
-        return {"status": r.status_code, "ok": r.ok}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-def ga4_post(mapped_events: List[Dict[str,Any]], cfg):
-    if not cfg.get("enable_ga4"): return {"skipped": True}
-    if not GA4_URL: return {"skipped": True, "reason":"missing_ga4_config"}
-    body = {"client_id": str(uuid.uuid4()), "events": mapped_events}
-    try:
-        r = requests.post(GA4_URL, json=body, timeout=10)
-        return {"status": r.status_code, "ok": r.ok, "text": r.text[:300]}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-# -------------------- Sim mapping --------------------
 _ALLOWED_CURRENCIES = {"AUTO","NULL","USD","EUR","GBP","AUD","CAD","JPY"}
-
-DEVICES   = ["mobile","mobile","desktop","tablet"]
-SOURCES   = ["direct","seo","sem","email","social","referral"]
-COUNTRIES = ["US","US","US","CA","GB","DE","AU"]
-CURRENCIES= ["USD","USD","USD","EUR","GBP","AUD","CAD","JPY"]
-CATS      = ["Tops","Bottoms","Shoes","Accessories","Home","Outerwear"]
-
+DEVICES=['mobile','mobile','desktop','tablet']
+SOURCES=['direct','seo','sem','email','social','referral']
+COUNTRIES=['US','US','US','CA','GB','DE','AU']
+CURRENCIES=['USD','USD','USD','EUR','GBP','AUD','CAD','JPY']
+CATS=['Tops','Bottoms','Shoes','Accessories','Home','Outerwear']
 def _uid(): return str(uuid.uuid4())
-
 def _make_session(cfg):
     return {
-        "user_id": f"u_{_rng.randint(1, 9_999_999)}",
+        "user_id": f"u_{_rng.randint(1,9999999)}",
         "session_id": _uid(),
         "device": rand_choice(DEVICES),
         "country": rand_choice(COUNTRIES),
@@ -369,175 +184,121 @@ def _make_session(cfg):
         "currency": rand_choice(CURRENCIES),
         "store_id": "store-001",
     }
-
 def _make_product(cfg):
-    base = 10000
-    size = max(1, int(cfg.get("product_catalog_size", 200)))
-    n = base + _rng.randint(0, size - 1)
-    lo, hi = float(cfg["price_min"]), max(float(cfg["price_min"])+0.01, float(cfg["price_max"]))
-    price = round(rand_triangular(lo, hi, (lo*0.7 + hi*0.3)), 2)
-    cat = rand_choice(CATS)
+    base=10000; size=max(1,int(cfg.get('product_catalog_size',200)))
+    n = base + _rng.randint(0,size-1)
+    lo,hi=float(cfg['price_min']), max(float(cfg['price_min'])+0.01, float(cfg['price_max']))
+    price=round(rand_triangular(lo,hi,(lo*0.7+hi*0.3)),2)
+    cat=rand_choice(CATS)
     return {"product_id": f"SKU-{n}", "name": f"{cat} {n}", "category": cat, "price": price}
-
 def build_contents(lines):
-    return [{"id": li["product_id"], "quantity": int(li["qty"]), "item_price": float(li["price"])} for li in (lines or [])]
-
-def contents_subtotal(contents):
-    s = 0.0
-    for c in contents or []:
-        try: s += float(c.get("quantity",0)) * float(c.get("item_price",0))
-        except Exception: pass
-    return round(s,2)
-
-def _collect_user_data_for_capi(cfg):
-    # Minimal user_data: include IP/UA (available) for matchability
-    ip = request.remote_addr if has_request_context() else "127.0.0.1"
-    ua = (request.headers.get("User-Agent","AutoRunner/1.0") if has_request_context()
-                  else "AutoRunner/1.0")
-    ud = {"client_ip_address": ip, "client_user_agent": ua}
-    return ud
-
-def map_sim_event_to_capi(e, cfg):
-    et   = e.get("event_type")
-    sess = e.get("user", {})
-    ctx  = e.get("context", {})
-
-    cur = ctx.get("currency","USD")
-    cur = _apply_currency_override(cur, cfg, channel="capi")
-
-    ts_unix = _apply_clock_skew(iso_to_unix(e["timestamp"]), cfg)
-
-    page = e.get("page") or "/"
-    if et == "product_view" and "product" in e:
-        page = f"/product/{e['product']['product_id']}"
-    if et in ("add_to_cart","begin_checkout","purchase"):
-        page = "/checkout"
-    event_source_url = BASE_URL.rstrip("/") + page
-
+    return [{"id":li["product_id"],"quantity":int(li["qty"]),"item_price":float(li["price"])} for li in (lines or [])]
+def _apply_currency_override(cur, cfg, channel='capi'):
+    ov=(cfg.get('currency_override') or 'AUTO').upper()
+    mm=(cfg.get('mismatch_currency') or 'NONE').upper()
+    if mm=='PIXEL' and channel=='pixel': return None if cur else 'USD'
+    if mm=='CAPI' and channel=='capi': return None if cur else 'USD'
+    if ov=='NULL': return None
+    elif ov!='AUTO': return ov
+    return cur
+def _schema_mutations(cd, cfg):
+    if not cd: return cd
+    out=dict(cd)
+    if cfg.get('schema_remove_contents'): out.pop('contents',None)
+    if cfg.get('schema_empty_arrays'):
+        if 'contents' in out: out['contents']=[]
+        if 'content_ids' in out: out['content_ids']=[]
+    if cfg.get('schema_unknown_fields'): out['unknown_field_xyz']='foo'
+    return out
+def _apply_clock_skew(ts_unix, cfg):
+    return int(ts_unix + int(cfg.get('clock_skew_seconds',0)))
+def _compile_user_data(sess, cfg):
     client_ip = request.remote_addr if has_request_context() else "127.0.0.1"
-    user_agent = (request.headers.get("User-Agent","AutoRunner/1.0") if has_request_context()
-                  else "AutoRunner/1.0")
-
-    base = {
-        "event_time": ts_unix,
-        "event_id": e.get("event_id"),
-        "action_source": "website",
-        "event_source_url": event_source_url,
-        "user_data": {
-            "external_id": sha256_norm(sess.get("user_id","")),
-            "client_ip_address": client_ip,
-            "client_user_agent": user_agent
-        }
-    }
-
-    out = []
-    if et == "page_view":
-        out = [{**base, "event_name":"PageView"}]
-
-    elif et == "product_view":
-        p = e["product"]
-        cd = {
-            "content_type":"product",
-            "content_ids":[p["product_id"]],
-            "value": float(p["price"]),
-            "currency": cur
-        }
-        cd = append_margin_pltv(cd, cfg, single_price=cd["value"], contents=None)
-        cd = _schema_mutations(cd, cfg)
-        out = [{**base, "event_name":"ViewContent", "custom_data": cd}]
-
-    elif et == "add_to_cart":
-        li = e["line_item"]
-        contents = [{"id": li["product_id"], "quantity": int(li["qty"]), "item_price": float(li["price"])}]
-        cd = {
-            "content_type":"product",
-            "content_ids":[li["product_id"]],
-            "contents": contents,
-            "value": float(li["qty"]) * float(li["price"]),
-            "currency": cur
-        }
-        cd = append_margin_pltv(cd, cfg, single_price=None, contents=contents)
-        cd = _schema_mutations(cd, cfg)
-        out = [{**base, "event_name":"AddToCart", "custom_data": cd}]
-
-    elif et == "begin_checkout":
-        cart = e["cart"]
-        contents = build_contents(cart)
-        total = float(e.get("total", 0.0))
-        cd = {"contents": contents, "value": total, "currency": cur}
-        cd = append_margin_pltv(cd, cfg, single_price=None, contents=contents)
-        cd = _schema_mutations(cd, cfg)
-        out = [{**base, "event_name":"InitiateCheckout", "custom_data": cd}]
-
-    elif et == "purchase":
-        items = e["items"]
-        contents = build_contents(items)
-        total = float(e.get("total", 0.0))
-        cd = {"contents": contents, "value": total, "currency": cur}
-        cd = append_margin_pltv(cd, cfg, single_price=None, contents=contents)
-        cd = _schema_mutations(cd, cfg)
-        out = [{**base, "event_name":"Purchase", "custom_data": cd}]
-
-    elif et == "return_initiated":
-        pid = e.get("product_id")
-        cd = {"content_type":"product", "content_ids":[pid] if pid else [], "value": 0.0, "currency": cur}
-        cd = append_margin_pltv(cd, cfg, single_price=0.0, contents=None)
-        cd = _schema_mutations(cd, cfg)
-        out = [{**base, "event_name":"ReturnInitiated", "custom_data": cd}]
-
-    # apply bad-data toggles (only if chaos_enabled)
+    user_agent = (request.headers.get("User-Agent","AutoRunner/1.0") if has_request_context() else "AutoRunner/1.0")
+    ud = {"external_id": sha256_norm(sess.get("user_id","")), "client_user_agent": user_agent}
+    if cfg.get("user_signal_ip"): ud["client_ip_address"] = client_ip
+    if cfg.get("user_signal_em"):
+        em=(cfg.get("user_default_email") or "").strip()
+        if em: ud["em"]=[sha256_norm(em)]
+    if cfg.get("user_signal_fbc"):
+        fbc=(cfg.get("user_default_fbc") or ("" if not LAST_USERDATA.get("fbc") else LAST_USERDATA["fbc"])).strip()
+        if fbc: ud["fbc"]=fbc
+    if cfg.get("user_signal_fbp"):
+        fbp=(cfg.get("user_default_fbp") or ("" if not LAST_USERDATA.get("fbp") else LAST_USERDATA["fbp"])).strip()
+        if fbp: ud["fbp"]=fbp
+    return ud
+def map_sim_event_to_capi(e, cfg):
+    et=e.get("event_type"); sess=e.get("user",{}); ctx=e.get("context",{})
+    cur = _apply_currency_override(ctx.get("currency","USD"), cfg, channel="capi")
+    ts_unix = _apply_clock_skew(iso_to_unix(e["timestamp"]), cfg)
+    page = e.get("page") or "/"
+    if et=="product_view" and "product" in e: page=f"/product/{e['product']['product_id']}"
+    if et in ("add_to_cart","begin_checkout","purchase"): page="/checkout"
+    event_source_url = BASE_URL.rstrip("/") + page
+    base={"event_time": ts_unix, "event_id": e.get("event_id"), "action_source":"website", "event_source_url": event_source_url, "user_data": _compile_user_data(sess,cfg)}
+    out=[]
+    if et=="page_view":
+        out=[{**base,"event_name":"PageView"}]
+    elif et=="product_view":
+        p=e["product"]; cd={"content_type":"product","content_ids":[p["product_id"]],"value": float(p["price"]), "currency": cur}
+        cd=append_margin_pltv(cd, cfg, single_price=cd["value"], contents=None); cd=_schema_mutations(cd,cfg)
+        out=[{**base,"event_name":"ViewContent","custom_data":cd}]
+    elif et=="add_to_cart":
+        li=e["line_item"]; contents=[{"id":li["product_id"],"quantity":int(li["qty"]),"item_price": float(li["price"])}]
+        cd={"content_type":"product","content_ids":[li["product_id"]],"contents":contents,"value": float(li["qty"])*float(li["price"]),"currency": cur}
+        cd=append_margin_pltv(cd,cfg,single_price=None,contents=contents); cd=_schema_mutations(cd,cfg)
+        out=[{**base,"event_name":"AddToCart","custom_data":cd}]
+    elif et=="begin_checkout":
+        contents=build_contents(e["cart"]); total=float(e.get("total",0.0))
+        cd={"contents":contents,"value":total,"currency":cur}
+        cd=append_margin_pltv(cd,cfg,single_price=None,contents=contents); cd=_schema_mutations(cd,cfg)
+        out=[{**base,"event_name":"InitiateCheckout","custom_data":cd}]
+    elif et=="purchase":
+        contents=build_contents(e["items"]); total=float(e.get("total",0.0))
+        cd={"contents":contents,"value":total,"currency":cur}
+        cd=append_margin_pltv(cd,cfg,single_price=None,contents=contents); cd=_schema_mutations(cd,cfg)
+        out=[{**base,"event_name":"Purchase","custom_data":cd}]
+    elif et=="return_initiated":
+        pid=e.get("product_id"); cd={"content_type":"product","content_ids":[pid] if pid else [],"value":0.0,"currency":cur}
+        cd=append_margin_pltv(cd,cfg,single_price=0.0,contents=None); cd=_schema_mutations(cd,cfg)
+        out=[{**base,"event_name":"ReturnInitiated","custom_data":cd}]
+    # bad toggles
     for ev in out:
-        if cfg.get("chaos_enabled") and cfg.get("null_event_id"):
-            ev["event_id"] = None
+        if cfg.get("null_event_id"): ev["event_id"]=None
         cd = ev.get("custom_data") or {}
-        if cfg.get("chaos_enabled") and cfg.get("null_currency") and "currency" in cd:
-            cd["currency"] = None
-        if cfg.get("chaos_enabled") and cfg.get("null_price"):
-            if "value" in cd:
-                cd["value"] = None
+        if cfg.get("null_currency") and "currency" in cd: cd["currency"]=None
+        if cfg.get("null_price"):
+            if "value" in cd: cd["value"]=None
             if "contents" in cd and isinstance(cd["contents"], list):
                 for c in cd["contents"]:
-                    if isinstance(c, dict) and "item_price" in c:
-                        c["item_price"] = None
-        ev["custom_data"] = cd
-
-    out = [_maybe_str_nums(ev, cfg) for ev in out]
+                    if isinstance(c, dict) and "item_price" in c: c["item_price"]=None
+        ev["custom_data"]=cd
+    return out
+def map_sim_event_to_ga4(e, cfg):
+    et=e.get("event_type"); out=[]
+    if et=="product_view":
+        p=e["product"]; out.append({"name":"view_item","params":{"currency": e["context"]["currency"], "value": p["price"], "items":[{"item_id":p["product_id"],"price":p["price"]}]}})
+    elif et=="add_to_cart":
+        li=e["line_item"]; out.append({"name":"add_to_cart","params":{"currency": e["context"]["currency"], "value": li["qty"]*li["price"], "items":[{"item_id":li["product_id"],"quantity":li["qty"],"price":li["price"]}]}})
+    elif et=="begin_checkout":
+        total=e.get("total",0.0); out.append({"name":"begin_checkout","params":{"currency": e["context"]["currency"], "value": total}})
+    elif et=="purchase":
+        total=e.get("total",0.0); out.append({"name":"purchase","params":{"currency": e["context"]["currency"], "value": total, "transaction_id": e.get("order_id","")}})
     return out
 
-def map_sim_event_to_ga4(e, cfg) -> List[Dict[str,Any]]:
-    et = e.get("event_type")
-    events = []
-    if et == "product_view":
-        p = e["product"]
-        events.append({"name":"view_item", "params":{"currency": e["context"]["currency"], "value": p["price"], "items":[{"item_id": p["product_id"], "price": p["price"]}]}})
-    elif et == "add_to_cart":
-        li = e["line_item"]
-        events.append({"name":"add_to_cart", "params":{"currency": e["context"]["currency"], "value": li["qty"]*li["price"], "items":[{"item_id": li["product_id"], "quantity":li["qty"], "price": li["price"]}]}})
-    elif et == "begin_checkout":
-        total = e.get("total", 0.0)
-        events.append({"name":"begin_checkout", "params":{"currency": e["context"]["currency"], "value": total}})
-    elif et == "purchase":
-        total = e.get("total", 0.0)
-        events.append({"name":"purchase", "params":{"currency": e["context"]["currency"], "value": total, "transaction_id": e.get("order_id","")}})
-    return events
-
-# -------------------- HTML (embedded) --------------------
 def banner_html():
-    banners = []
-    if not PIXEL_ID:
-        banners.append("PIXEL_ID missing: Pixel will initialize but may not attribute correctly.")
-    if not (ACCESS_TOKEN and PIXEL_ID):
-        banners.append("CAPI not fully configured: set PIXEL_ID and ACCESS_TOKEN to enable server sends.")
-    if CONFIG.get("enable_ga4") and not (GA4_MEASUREMENT_ID and GA4_API_SECRET):
-        banners.append("GA4 enabled but GA4 credentials missing.")
-    return "".join(f'<div class="banner">{msg}</div>' for msg in banners)
+    banners=[]
+    if not PIXEL_ID: banners.append("PIXEL_ID missing: Pixel will initialize but may not attribute correctly.")
+    if not (ACCESS_TOKEN and PIXEL_ID): banners.append("CAPI not fully configured: set PIXEL_ID and ACCESS_TOKEN.")
+    if CONFIG.get("enable_ga4") and not (GA4_MEASUREMENT_ID and GA4_API_SECRET): banners.append("GA4 enabled but missing GA4 creds.")
+    return "".join(f'<div class="banner">{x}</div>' for x in banners)
 
-PAGE_HTML_HEAD = """<!doctype html>
+page_head = '''<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Store Simulator</title>
+<title>Store — Simulator</title>
 <style>
-:root { --bd:#223040; --fg:#e6eef7; --muted:#9fb3c8; --ok:#28c76f; --err:#ff5c5c; --bg:#0b0f14; --panel:#0e1520; }
+:root { --bd:#223040; --fg:#e6eef7; --muted:#9fb3c8; --ok:#28c76f; --err:#ff5c5c; --bg:#0b0f14; --panel:#0e1520; --pulse:#45aaf2; }
 * { box-sizing:border-box }
 body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; background: radial-gradient(1200px 800px at 80% -10%, #12263c 0%, #0b0f14 60%); color: var(--fg); }
 .container { max-width:1200px; margin:20px auto; padding:0 16px; }
@@ -552,49 +313,52 @@ h3 { margin:0 0 8px; font-size:16px; }
 input, select, textarea { background:#0e1722; color:var(--fg); border:1px solid var(--bd); border-radius:10px; padding:8px 10px; }
 textarea { width:100%; min-height:90px; }
 .btn { position:relative; border:1px solid var(--bd); background:#0e1722; color:var(--fg); padding:8px 12px; border-radius:10px; cursor:pointer; }
-.btn .tick, .btn .x { position:absolute; right:8px; top:50%; transform:translateY(-50%) scale(0.8); opacity:0; transition:opacity .18s, transform .18s; }
-.btn .tick { color:var(--ok); } .btn .x { color:var(--err); }
-.btn .tick svg, .btn .x svg { width:18px; height:18px; }
 .table { width:100%; border-collapse:collapse; font-size:12px; }
 .table th, .table td { border-bottom:1px solid #183048; padding:6px 8px; vertical-align:top; }
-.badge { display:inline-block; border:1px solid var(--bd); padding:2px 8px; border-radius:999px; font-size:11px; color:var(--muted); }
 .topbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:10px 0; }
-.spark { width:120px; height:36px; }
+.pill { display:inline-flex; align-items:center; gap:8px; border:1px solid var(--bd); padding:6px 10px; border-radius:999px; font-size:12px; cursor:pointer; user-select:none; }
+.pill[data-on="true"] { border-color:#2c7; background:rgba(60,255,160,0.06); }
+.dot { width:8px; height:8px; border-radius:50%; background:#999; position:relative; }
+.dot[data-on="true"] { background: var(--ok); }
+.dot[data-on="true"]::after { content:""; position:absolute; inset:-6px; border-radius:50%; border:2px solid var(--pulse); opacity:0.8; animation:p 1.4s ease-out infinite; }
+@keyframes p { 0%{transform:scale(0.4); opacity:1} 80%{transform:scale(1.4); opacity:0} 100%{opacity:0} }
 pre { margin:0; white-space:pre-wrap; word-break:break-word; }
 code { color:#cbd9ff; }
 .warn { color:#ffcf6e }
 .flex { display:flex; gap:10px; }
-
-/* Pulser */
-.pulse-dot{ width:10px; height:10px; border-radius:999px; background:#7ad47a; box-shadow:0 0 0 0 rgba(122,212,122,0.7); animation:pulse 2s infinite; display:inline-block; vertical-align:middle; }
-.pulse-dot.off{ background:#777; box-shadow:none; animation:none; }
-@keyframes pulse{ 0%{ box-shadow:0 0 0 0 rgba(122,212,122,0.7);} 70%{ box-shadow:0 0 0 10px rgba(122,212,122,0);} 100%{ box-shadow:0 0 0 0 rgba(122,212,122,0);} }
-
-/* Toggle */
-.toggle { position:relative; width:46px; height:24px; background:#223; border-radius:999px; border:1px solid #2f4155; cursor:pointer; }
-.toggle input{ display:none; }
-.toggle .knob{ position:absolute; top:2px; left:2px; width:20px; height:20px; border-radius:999px; background:#999; transition:all .18s; }
-.toggle input:checked + .knob{ left:24px; background:#28c76f; }
+.badge { display:inline-block; border:1px solid var(--bd); padding:2px 8px; border-radius:999px; font-size:11px; color:var(--muted); }
 </style>
 <script>
 function rid(){ return 'evt_' + Math.random().toString(36).slice(2) + Date.now().toString(36); }
-function flashIcon(btn, ok){ if(!btn) return; const cls = ok ? 'show-tick' : 'show-err'; btn.classList.add(cls); setTimeout(()=>btn.classList.remove(cls), 1000); }
-async function fetchJSON(url, opts){ const r = await fetch(url, opts); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); }
-async function fetchOK(url, opts){ try{ const r = await fetch(url, opts); return r.ok; }catch(e){ return false; } }
+async function fetchJSON(url, opts){ const r = await fetch(url, opts||{}); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); }
+async function fetchOK(url, opts){ try{ const r = await fetch(url, opts||{}); return r.ok; }catch(e){ return false; } }
 function copyTxt(t){ navigator.clipboard.writeText(t).catch(()=>{}); }
-function setDot(id, on){ const el = document.getElementById(id); if(!el) return; if(on){ el.classList.remove('off'); } else { el.classList.add('off'); } }
+function cookieGet(name){ return ('; '+document.cookie).split('; '+name+'=').pop().split(';')[0]; }
+function getFbp(){ return cookieGet('_fbp') || ''; }
+function getFbc(){
+  const c = cookieGet('_fbc'); if(c) return c;
+  const url = new URL(location.href); const fbclid = url.searchParams.get('fbclid');
+  if(!fbclid) return '';
+  const ts = Math.floor(Date.now()/1000);
+  return 'fb.1.'+ts+'.'+fbclid;
+}
 </script>
-"""
-
-PAGE_HTML_BODY_PREFIX = """
+'''
+page_body = '''
 </head><body>
 <div class="container">
   <h1>Store Simulator <span class="small">v__APP_VERSION__</span></h1>
   __BANNERS__
+
   <div class="topbar">
-    <span class="badge" id="badge_pixel">Pixel: ?</span>
-    <span class="badge" id="badge_capi">CAPI: ?</span>
-    <span class="badge" id="badge_test">Test Code: __TEST_ONOFF__</span>
+    <div id="pill_pixel" class="pill"><span class="dot" id="dot_pixel"></span><span>Pixel: <b id="txt_pixel">?</b></span></div>
+    <div id="pill_capi" class="pill"><span class="dot" id="dot_capi"></span><span>CAPI: <b id="txt_capi">?</b></span></div>
+    <div id="pill_test" class="pill" style="gap:6px;">
+      <span class="dot" id="dot_test"></span><span>Test Events: <b id="txt_test">?</b></span>
+      <input id="in_testcode" placeholder="test code" style="width:120px"/>
+      <button class="btn" id="btn_set_test">Set</button>
+      <button class="btn" id="btn_clear_test">Clear</button>
+    </div>
     <span class="badge" id="badge_seed">Seed: none</span>
     <span class="badge" id="badge_preset">Preset: Default</span>
     <span class="badge" id="badge_ga4">GA4: __GA4_ONOFF__</span>
@@ -602,76 +366,43 @@ PAGE_HTML_BODY_PREFIX = """
 
   <div class="grid">
     <div class="card">
-      <h3>Pixel Self‑Test</h3>
-      <p class="small">Quickly fire Pixel events for sanity checks. These also post telemetry to the server for dedup/diff.</p>
+      <h3>Pixel Self-Test</h3>
+      <p class="small">Manual Pixel events (browser). We also ping the server so dedup & console work.</p>
       <div class="row" style="gap:10px; margin-bottom:6px;">
-        <button class="btn" onclick="sendView(this)">ViewContent
-          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
-          <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
-        </button>
-        <button class="btn" onclick="sendATC(this)">AddToCart
-          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
-          <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
-        </button>
-        <button class="btn" onclick="sendInitiate(this)">InitiateCheckout
-          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
-          <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
-        </button>
-        <button class="btn" onclick="sendPurchase(this)">Purchase
-          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
-          <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
-        </button>
+        <button class="btn" onclick="sendView(this)">ViewContent</button>
+        <button class="btn" onclick="sendATC(this)">AddToCart</button>
+        <button class="btn" onclick="sendInitiate(this)">InitiateCheckout</button>
+        <button class="btn" onclick="sendPurchase(this)">Purchase</button>
       </div>
-
-      <div class="row">
-        <span class="small">Next Event Preview:</span>
-        <pre id="previewBox" style="width:100%; background:#0b1320; border:1px solid var(--bd); border-radius:10px; padding:8px; margin-top:6px; height:120px; overflow:auto;">{}</pre>
-      </div>
-      <div class="row small">
-        <label><input id="share_event_id_to_capi" type="checkbox"> Share event_id to CAPI (for dedup)</label>
-      </div>
+      <div class="row small">Next Event Preview:</div>
+      <pre id="previewBox" style="width:100%; background:#0b1320; border:1px solid var(--bd); border-radius:10px; padding:8px; margin-top:6px; height:120px; overflow:auto;">{}</pre>
     </div>
 
-    <!-- Pixel Auto (browser-side) -->
     <div class="card">
       <h3>Pixel Auto (browser → Pixel)</h3>
-      <p class="small">Automatically fires Meta Pixel events from the browser. Respects Enable Pixel, currency/price nulls, mismatch, and event-ID toggles.</p>
       <div class="row">
         <label>Events/sec</label>
         <input id="px_rps" type="number" step="0.1" min="0.1" value="0.5"/>
-        <span class="small">Status</span><span id="px_dot" class="pulse-dot off" aria-label="pixel auto status"></span>
+        <span class="small">Status:</span>
+        <span class="dot" id="dot_px_auto"></span>
       </div>
       <div class="row">
-        <button id="pxStartBtn" class="btn" onclick="pixelAutoStart(this)">
-          Start
-          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
-          <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
-        </button>
-        <button id="pxStopBtn" class="btn" onclick="pixelAutoStop(this)" disabled>
-          Stop
-          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
-          <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
-        </button>
+        <button id="pxStartBtn" class="btn" onclick="pixelAutoStart(this)">Start</button>
+        <button id="pxStopBtn" class="btn" onclick="pixelAutoStop(this)" disabled>Stop</button>
       </div>
       <p id="px_status" class="small">Stopped</p>
     </div>
 
     <div class="card">
       <h3>Auto Stream (server → CAPI)</h3>
-      <p class="small">Streams sessions to CAPI (and optional sinks). If <b>Enable CAPI</b> is off, nothing is sent.</p>
       <div class="row">
         <label>Sessions/sec</label><input id="rps" type="number" step="0.1" min="0.1" value="0.5"/>
-        <span class="small">Status</span><span id="svr_dot" class="pulse-dot off" aria-label="server auto status"></span>
+        <span class="small">Status:</span>
+        <span class="dot" id="dot_srv_auto"></span>
       </div>
       <div class="row">
-        <button id="startBtn" class="btn" onclick="startAuto(this)">Start
-          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
-          <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
-        </button>
-        <button id="stopBtn" class="btn" onclick="stopAuto(this)">Stop
-          <span class="tick" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.3 5.7a1 1 0 0 1 0 1.4l-10 10a1 1 0 0 1-1.4 0l-5-5a1 1 0 1 1 1.4-1.4l4.3 4.3L18.9 5.7a1 1 0 0 1 1.4 0z"/></svg></span>
-          <span class="x" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M18.3 5.7a1 1 0 0 1 0 1.4L13.4 12l4.9 4.9a1 1 0 1 1-1.4 1.4L12 13.4l-4.9 4.9a1 1 0 0 1-1.4-1.4L10.6 12 5.7 7.1A1 1 0 1 1 7.1 5.7L12 10.6l4.9-4.9a1 1 0 0 1 1.4 0z"/></svg></span>
-        </button>
+        <button id="startBtn" class="btn" onclick="startAuto(this)">Start</button>
+        <button id="stopBtn" class="btn" onclick="stopAuto(this)">Stop</button>
       </div>
       <p id="status" class="small">…</p>
       <div class="row small">
@@ -700,9 +431,6 @@ PAGE_HTML_BODY_PREFIX = """
 
     <div class="card">
       <h3>Advanced Controls</h3>
-      <div class="row"><label class="small">Enable Pixel</label><input id="enable_pixel" type="checkbox"/></div>
-      <div class="row"><label class="small">Enable CAPI</label><input id="enable_capi" type="checkbox"/></div>
-      <hr/>
       <div class="row"><label>P(Add to Cart)</label><input id="p_add_to_cart" type="number" step="0.01" min="0" max="1" value="0.35"/></div>
       <div class="row"><label>P(Begin Checkout)</label><input id="p_begin_checkout" type="number" step="0.01" min="0" max="1" value="0.70"/></div>
       <div class="row"><label>P(Purchase)</label><input id="p_purchase" type="number" step="0.01" min="0" max="1" value="0.70"/></div>
@@ -731,17 +459,11 @@ PAGE_HTML_BODY_PREFIX = """
       <div class="row"><label>Append PLTV</label><input id="append_pltv" type="checkbox" checked/></div>
       <div class="row"><label>PLTV min</label><input id="pltv_min" type="number" step="0.01" min="0" value="120"/></div>
       <div class="row"><label>PLTV max</label><input id="pltv_max" type="number" step="0.01" min="0" value="600"/></div>
-      <hr/>
-      <div class="row"><label><input id="share_event_id_to_capi_cfg" type="checkbox"/> Share event_id to CAPI</label></div>
     </div>
 
     <div class="card">
-      <h3>Discrepancy & Chaos</h3>
-      <div class="row">
-        <label class="small" style="margin-right:6px;">Enable</label>
-        <label class="toggle"><input type="checkbox" id="chaos_enabled"><span class="knob"></span></label>
-        <button class="btn" onclick="resetChaos(this)">Reset Chaos</button>
-      </div>
+      <h3>Chaos Generator</h3>
+      <div class="row"><button class="btn" onclick="resetChaos(this)">Reset Chaos</button></div>
       <div class="row"><label>Mismatch value ±%</label><input id="mismatch_value_pct" type="number" step="0.01" min="0" max="1" value="0"/></div>
       <div class="row"><label>Mismatch currency</label>
         <select id="mismatch_currency"><option>NONE</option><option>PIXEL</option><option>CAPI</option></select>
@@ -765,15 +487,15 @@ PAGE_HTML_BODY_PREFIX = """
       <div class="row"><label>Kill AddToCart</label><input id="kill_AddToCart" type="checkbox"/></div>
       <div class="row"><label>Kill InitiateCheckout</label><input id="kill_InitiateCheckout" type="checkbox"/></div>
       <div class="row"><label>Kill Purchase</label><input id="kill_Purchase" type="checkbox"/></div>
+      <div class="row"><label>Kill AppendValue</label><input id="kill_AppendValue" type="checkbox"/></div>
     </div>
 
     <div class="card">
-      <h3>Sinks & Tools</h3>
-      <div class="row"><label>Webhook sink</label><input id="enable_webhook" type="checkbox"/></div>
-      <div class="row"><label>GA4 sink</label><input id="enable_ga4" type="checkbox"/></div>
-      <div class="row"><button class="btn" onclick="saveConfig(this)">Save Controls</button></div>
-      <p class="small">File sink: __FILE_SINK_LABEL__</p>
-      <div class="row"><button class="btn" onclick="downloadReplay()">Download Replay Bundle</button></div>
+      <h3>User Data Signals (CAPI)</h3>
+      <div class="row"><label>Email (hashed)</label><input id="user_signal_em" type="checkbox"/><input id="user_default_email" placeholder="name@example.com" style="width:220px"/></div>
+      <div class="row"><label>IP Address</label><input id="user_signal_ip" type="checkbox"/><span class="small">Uses client IP of request</span></div>
+      <div class="row"><label>fbc (Click ID)</label><input id="user_signal_fbc" type="checkbox"/><input id="user_default_fbc" placeholder="fb.1..." style="width:220px"/></div>
+      <div class="row"><label>fbp (Browser ID)</label><input id="user_signal_fbp" type="checkbox"/><input id="user_default_fbp" placeholder="fb.1..." style="width:220px"/></div>
     </div>
 
     <div class="card" style="grid-column:1/-1;">
@@ -781,27 +503,68 @@ PAGE_HTML_BODY_PREFIX = """
       <div class="row small">
         <label>Filter</label>
         <select id="f_channel"><option value="">channel</option><option>pixel</option><option>capi</option><option>webhook</option><option>ga4</option></select>
-        <select id="f_type"><option value="">type</option><option>PageView</option><option>ViewContent</option><option>AddToCart</option><option>InitiateCheckout</option><option>Purchase</option><option>ReturnInitiated</option></select>
+        <select id="f_type"><option value="">type</option><option>PageView</option><option>ViewContent</option><option>AddToCart</option><option>InitiateCheckout</option><option>Purchase</option><option>ReturnInitiated</option><option>AppendValue</option></select>
         <select id="f_ok"><option value="">status</option><option value="1">ok</option><option value="0">error</option></select>
         <button class="btn" onclick="refreshConsole(this)">Refresh</button>
+        <button class="btn" onclick="resetMetrics(this)">Reset Metrics</button>
       </div>
       <div id="console_table" style="max-height:320px; overflow:auto; margin-top:6px;"></div>
     </div>
 
     <div class="card" style="grid-column:1/-1;">
-      <h3>Scenario Runner (JSON)</h3>
-      <p class="small">Paste a simple JSON scenario (steps with event types and waits). Example:
-      <code>{{"name":"cart_abandon","steps":[{{"page_view":{{"url":"/"}}}},{{"product_view":{{"sku":"SKU-10123"}}}},{{"add_to_cart":{{"qty":1}}}},{{"wait":12}},{{"begin_checkout":{{}}}}]}}</code></p>
-      <textarea id="scenario_text" placeholder='{{"name":"demo","steps":[{{"page_view":{{}}}},{{"product_view":{{}}}},{{"add_to_cart":{{"qty":1}}}},{{"begin_checkout":{{}}}},{{"purchase":{{}}}}]}}'></textarea>
-      <div class="row"><button class="btn" onclick="runScenario(this)">Run Scenario</button></div>
-      <p id="scenario_status" class="small">…</p>
+      <h3>AppendValue (Diagnostic, CAPI-only)</h3>
+      <p class="small">Sends <code>AppendValue</code> events tied to previous events by <code>event_id</code>. Uses <code>opt_out=true</code> so these won't affect optimization. Values beyond 7 days back will be rejected by Meta.</p>
+      <div class="row">
+        <label>Isolation: AppendValue only</label><input id="iso_append_only" type="checkbox"/>
+      </div>
+      <div class="row">
+        <label>Target types</label>
+        <select id="av_types" multiple size="4">
+          <option>Purchase</option>
+          <option>InitiateCheckout</option>
+          <option>AddToCart</option>
+          <option>ViewContent</option>
+        </select>
+        <span class="small">multi-select (Cmd/Ctrl+Click)</span>
+      </div>
+      <div class="row">
+        <label>Base events lookback (days)</label><input id="av_base_lookback" type="number" step="1" min="0" value="7"/>
+      </div>
+      <div class="row">
+        <label>Offset days (min)</label><input id="av_days_min" type="number" step="1" min="0" value="0"/>
+        <label>Offset days (max)</label><input id="av_days_max" type="number" step="1" min="0" value="7"/>
+      </div>
+      <div class="row">
+        <label>New total value range</label>
+        <input id="av_new_total_min" type="number" step="0.01" min="0" value="120"/>
+        <input id="av_new_total_max" type="number" step="0.01" min="0" value="600"/>
+      </div>
+      <div class="row">
+        <label>Schedule</label>
+        <label>RPS</label><input id="av_rps" type="number" step="0.1" min="0.1" value="0.5"/>
+        <label>Duration (s)</label><input id="av_dur" type="number" step="1" min="1" value="30"/>
+      </div>
+      <div class="row">
+        <button class="btn" onclick="appendPreview(this)">Preview Targets</button>
+        <button class="btn" onclick="appendStart(this)">Start Append Stream</button>
+        <button class="btn" onclick="appendStop(this)">Stop</button>
+      </div>
+      <p id="av_status" class="small">…</p>
+    </div>
+
+    <div class="card">
+      <h3>Sinks & Tools</h3>
+      <p class="small">Optional sinks: enable webhook/GA4, download replay bundle.</p>
+      <div class="row"><label>Webhook sink</label><input id="enable_webhook" type="checkbox"/></div>
+      <div class="row"><label>GA4 sink</label><input id="enable_ga4" type="checkbox"/></div>
+      <div class="row"><button class="btn" onclick="saveConfig(this)">Save Controls</button></div>
+      <p class="small">File sink: __FILE_SINK_LABEL__</p>
+      <div class="row"><button class="btn" onclick="downloadReplay()">Download Replay Bundle</button></div>
     </div>
   </div>
-"""
-
-PAGE_HTML_FOOT = """
+'''
+page_foot = '''
 <script>
-// ----- Pixel loader -----
 (function(){
   var s=document.createElement('script'); s.async=true; s.src='https://connect.facebook.net/en_US/fbevents.js';
   document.head.appendChild(s);
@@ -810,7 +573,45 @@ PAGE_HTML_FOOT = """
   fbq('init', '__PIXEL_ID__');
 })();
 
-// ----- UI helpers -----
+async function refreshPills(){
+  const cfg = await fetchJSON('/auto/config');
+  setPill('pixel', !!cfg.enable_pixel);
+  setPill('capi', !!cfg.enable_capi);
+  const on = !!(cfg.test_event_code);
+  setPill('test', on);
+  document.getElementById('txt_test').textContent = on ? 'on' : 'off';
+  document.getElementById('in_testcode').value = cfg.test_event_code || '';
+  document.getElementById('badge_seed').textContent = 'Seed: ' + (cfg.seed||'none');
+  document.getElementById('badge_preset').textContent= 'Preset: ' + (cfg.active_preset||'Default');
+}
+function setPill(kind, on){
+  document.getElementById('txt_'+kind).textContent = on ? 'on' : 'off';
+  document.getElementById('pill_'+kind).dataset.on = on ? 'true' : 'false';
+  const dot = document.getElementById('dot_'+kind);
+  dot.dataset.on = on ? 'true' : 'false';
+}
+document.getElementById('pill_pixel').addEventListener('click', async ()=>{
+  const on = document.getElementById('pill_pixel').dataset.on !== 'true';
+  await fetchOK('/toggle/pixel', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({on})});
+  if(on) pixelAutoStart(); else pixelAutoStop();
+  await refreshStatus(); await refreshPills();
+});
+document.getElementById('pill_capi').addEventListener('click', async ()=>{
+  const on = document.getElementById('pill_capi').dataset.on !== 'true';
+  await fetchOK('/toggle/capi', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({on})});
+  if(on){ await startAuto(); } else { await stopAuto(); }
+  await refreshStatus(); await refreshPills();
+});
+document.getElementById('btn_set_test').addEventListener('click', async ()=>{
+  const code = document.getElementById('in_testcode').value||'';
+  await fetchOK('/toggle/testcode', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({code})});
+  await refreshPills();
+});
+document.getElementById('btn_clear_test').addEventListener('click', async ()=>{
+  await fetchOK('/toggle/testcode', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({code:''})});
+  await refreshPills();
+});
+
 function readBadToggles(){
   return {
     null_price: document.getElementById('null_price').checked,
@@ -824,7 +625,7 @@ function marginFromPrice(price, minPct, maxPct){
   const cost = Math.max(0, price * pct);
   return Math.max(0, Math.round((price - cost) * 100)/100);
 }
-function attachMarginPltv(payload, price, cfg){
+function attachMarginPltv(payload, price){
   if (document.getElementById('append_margin').checked){
     let m = null;
     if (Array.isArray(payload.contents) && payload.contents.length){
@@ -852,42 +653,28 @@ function currentCurrency(channel){
   const mode = (document.getElementById('currency_override').value || 'AUTO').toUpperCase();
   const bad = readBadToggles();
   const mm = (document.getElementById('mismatch_currency').value||'NONE').toUpperCase();
-  const chaos = document.getElementById('chaos_enabled').checked;
-  if (chaos && mm==='PIXEL' && channel==='pixel') return null;
+  if (mm==='PIXEL' && channel==='pixel') return null;
   if (mode==='NULL') return null;
   if (bad.null_currency) return null;
   if (mode!=='AUTO') return mode;
   return 'USD';
 }
-
-// ----- Next-event preview -----
-function updatePreview(){
-  const price = 68.99, qty = 2, total = 149.02;
-  const p = { contents:[{id:'SKU-10057',quantity:qty,item_price:price}], currency: currentCurrency('pixel'), value: total };
-  attachMarginPltv(p, null, null);
-  document.getElementById('previewBox').textContent = JSON.stringify(p, null, 2);
-}
-
-// ----- Discrepancy helpers -----
 function maybeMismatchValue(val){
-  const chaos = document.getElementById('chaos_enabled').checked;
-  const pct = chaos ? parseFloat(document.getElementById('mismatch_value_pct').value||'0') : 0;
+  const pct = parseFloat(document.getElementById('mismatch_value_pct').value||'0');
   if (!pct || !val) return val;
   const delta = val * pct;
   return Math.round((val + randBetween(-delta, delta))*100)/100;
 }
 function maybeDesyncEventId(eid){
-  return document.getElementById('chaos_enabled').checked && document.getElementById('desync_event_id').checked ? eid + '_px' : eid;
+  return document.getElementById('desync_event_id').checked ? eid + '_px' : eid;
 }
 function maybeDropPixel(){
-  if (!document.getElementById('chaos_enabled').checked) return false;
   const n = parseInt(document.getElementById('drop_pixel_every_n').value||'0',10);
   if (!n) return false;
   window.__pxCount = (window.__pxCount||0) + 1;
   return window.__pxCount % n === 0;
 }
 function maybeDupePixelId(eid){
-  if (!document.getElementById('chaos_enabled').checked) return eid;
   const n = parseInt(document.getElementById('duplicate_event_id_n').value||'0',10);
   if (!n) return eid;
   window.__dupeIdx = (window.__dupeIdx||0) + 1;
@@ -896,79 +683,52 @@ function maybeDupePixelId(eid){
   return eid;
 }
 
-// ----- Pixel send & server telemetry -----
 let ENABLE_PIXEL = true;
 async function sendPixel(name, payload, opts, btn){
-  if (!ENABLE_PIXEL) { flashIcon(btn, false); return; }
   const intended = JSON.parse(JSON.stringify(payload));
+  if (!ENABLE_PIXEL) { return; }
   if ('value' in payload) payload.value = maybeMismatchValue(payload.value);
   const eid0 = (opts && opts.eventID) || rid();
   const eid = maybeDupePixelId(maybeDesyncEventId(eid0));
-  const dropped = maybeDropPixel();
-  if (dropped) {
-    await fetch('/metrics/pixel', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({event_name:name,intended, sent:payload, event_id:eid, dropped:true})}).catch(()=>{});
-    flashIcon(btn, true); return;
+  const metaIds = { fbc: getFbc(), fbp: getFbp() };
+  if (maybeDropPixel()) {
+    await fetch('/metrics/pixel', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({event_name:name,intended, sent:payload, event_id:eid, dropped:true, ...metaIds})}).catch(()=>{});
+    return;
   }
   try { fbq('track', name, payload, { eventID: eid }); } catch(e) {}
-  await fetch('/metrics/pixel', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({event_name:name,intended, sent:payload, event_id:eid})}).catch(()=>{});
-  // If user asked to share to CAPI, the server will forward using this same event_id
-  if (document.getElementById('share_event_id_to_capi').checked) {
-    try { await fetch('/config/share_eid', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({share:true})}); } catch(e) {}
-  }
-  flashIcon(btn, true);
+  await fetch('/metrics/pixel', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({event_name:name,intended, sent:payload, event_id:eid, ...metaIds})}).catch(()=>{});
 }
 
 function sendView(btn){
   const bad = readBadToggles();
   const price = 68.99;
-  const payload = {
-    content_type:'product',
-    content_ids:['SKU-10057'],
-    currency: currentCurrency('pixel'),
-    value: bad.null_price ? null : price
-  };
+  const payload = { content_type:'product', content_ids:['SKU-10057'], currency: currentCurrency('pixel'), value: bad.null_price ? null : price };
   attachMarginPltv(payload, price);
   sendPixel('ViewContent', payload, {eventID: bad.null_event_id ? null : rid()}, btn);
 }
 function sendATC(btn){
   const bad = readBadToggles();
   const price = 68.99, qty = 1, value = qty*price;
-  const payload = {
-    content_type:'product',
-    content_ids:['SKU-10057'],
-    contents:[{id:'SKU-10057', quantity:qty, item_price: bad.null_price ? null : price}],
-    currency: currentCurrency('pixel'),
-    value: bad.null_price ? null : value
-  };
+  const payload = { content_type:'product', content_ids:['SKU-10057'], contents:[{id:'SKU-10057', quantity:qty, item_price: bad.null_price ? null : price}], currency: currentCurrency('pixel'), value: bad.null_price ? null : value };
   attachMarginPltv(payload, null);
   sendPixel('AddToCart', payload, {eventID: bad.null_event_id ? null : rid()}, btn);
 }
 function sendInitiate(btn){
   const bad = readBadToggles();
   const price = 68.99, qty = 2, total = 149.02;
-  const payload = {
-    contents:[{id:'SKU-10057', quantity:qty, item_price: bad.null_price ? null : price}],
-    currency: currentCurrency('pixel'),
-    value: bad.null_price ? null : total
-  };
+  const payload = { contents:[{id:'SKU-10057', quantity:qty, item_price: bad.null_price ? null : price}], currency: currentCurrency('pixel'), value: bad.null_price ? null : total };
   attachMarginPltv(payload, null);
   sendPixel('InitiateCheckout', payload, {eventID: bad.null_event_id ? null : rid()}, btn);
 }
 function sendPurchase(btn){
   const bad = readBadToggles();
   const price = 68.99, qty = 2, total = 149.02;
-  const payload = {
-    contents:[{id:'SKU-10057', quantity:qty, item_price: bad.null_price ? null : price}],
-    currency: currentCurrency('pixel'),
-    value: bad.null_price ? null : total
-  };
+  const payload = { contents:[{id:'SKU-10057', quantity:qty, item_price: bad.null_price ? null : price}], currency: currentCurrency('pixel'), value: bad.null_price ? null : total };
   attachMarginPltv(payload, null);
   sendPixel('Purchase', payload, {eventID: bad.null_event_id ? null : rid()}, btn);
 }
 
-// ----- Pixel Auto Stream (browser -> Pixel) -----
 let __pxTimer = null;
-
 function pixelAutoTick(){
   if (!ENABLE_PIXEL) return;
   const r = Math.random();
@@ -977,7 +737,6 @@ function pixelAutoTick(){
   else if (r < 0.90) { sendInitiate(null); }
   else               { sendPurchase(null); }
 }
-
 function pixelAutoStart(btn){
   const rps = parseFloat(document.getElementById('px_rps').value || '0.5');
   const interval = Math.max(50, 1000 / Math.max(0.1, rps));
@@ -986,29 +745,24 @@ function pixelAutoStart(btn){
   document.getElementById('px_status').textContent = 'Running at ' + (Math.round((1000/interval)*100)/100) + ' events/sec';
   document.getElementById('pxStartBtn').disabled = true;
   document.getElementById('pxStopBtn').disabled = false;
-  setDot('px_dot', true);
-  flashIcon(btn, true);
+  document.getElementById('dot_px_auto').dataset.on = 'true';
 }
-
 function pixelAutoStop(btn){
   if (__pxTimer) clearInterval(__pxTimer);
   __pxTimer = null;
   document.getElementById('px_status').textContent = 'Stopped';
   document.getElementById('pxStartBtn').disabled = false;
   document.getElementById('pxStopBtn').disabled = true;
-  setDot('px_dot', false);
-  flashIcon(btn, true);
+  document.getElementById('dot_px_auto').dataset.on = 'false';
 }
-
 function pxRefreshStatus(){
   const running = !!__pxTimer;
   document.getElementById('px_status').textContent = running ? 'Running' : 'Stopped';
   document.getElementById('pxStartBtn').disabled = running;
   document.getElementById('pxStopBtn').disabled = !running;
-  setDot('px_dot', running);
+  document.getElementById('dot_px_auto').dataset.on = running ? 'true' : 'false';
 }
 
-// ----- Auto stream controls (server) -----
 async function refreshStatus(){
   try {
     const j = await fetchJSON('/auto/status');
@@ -1016,33 +770,33 @@ async function refreshStatus(){
     document.getElementById('startBtn').disabled = j.running;
     document.getElementById('stopBtn').disabled = !j.running;
     if (j.running) document.getElementById('rps').value = j.rps;
-    setDot('svr_dot', j.running);
+    document.getElementById('dot_srv_auto').dataset.on = j.running ? 'true' : 'false';
   } catch(e){ document.getElementById('status').textContent = 'Unknown'; }
 }
 async function startAuto(btn){
   const rps = parseFloat(document.getElementById('rps').value||'0.5');
   const ok = await fetchOK('/auto/start?rps='+encodeURIComponent(rps));
-  flashIcon(btn, ok); setTimeout(refreshStatus, 250);
+  if(ok) document.getElementById('dot_srv_auto').dataset.on = 'true';
 }
 async function stopAuto(btn){
-  const ok = await fetchOK('/auto/stop'); flashIcon(btn, ok); setTimeout(refreshStatus, 250);
+  const ok = await fetchOK('/auto/stop');
+  if(ok) document.getElementById('dot_srv_auto').dataset.on = 'false';
 }
 
-// ----- Presets & Seed -----
 async function saveSeed(btn){
   const seed = document.getElementById('seed').value||'';
-  const ok = await fetchOK('/config/seed', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({seed})}); 
-  flashIcon(btn, ok); updateBadges();
+  await fetchOK('/config/seed', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({seed})}); 
+  await refreshPills();
 }
 async function savePreset(btn){
   const name = document.getElementById('preset_name').value||'Preset';
-  const ok = await fetchOK('/presets/save?name='+encodeURIComponent(name), {method:'POST'});
-  flashIcon(btn, ok); updateBadges();
+  await fetchOK('/presets/save?name='+encodeURIComponent(name), {method:'POST'});
+  await refreshPills();
 }
 async function loadPreset(btn){
   const name = document.getElementById('preset_name').value||'Preset';
-  const ok = await fetchOK('/presets/load?name='+encodeURIComponent(name), {method:'POST'});
-  flashIcon(btn, ok); await loadConfig();
+  await fetchOK('/presets/load?name='+encodeURIComponent(name), {method:'POST'});
+  await loadConfig();
 }
 async function exportPreset(btn){
   const name = document.getElementById('preset_name').value||'Preset';
@@ -1054,36 +808,15 @@ document.getElementById('import_preset').addEventListener('change', async (e)=>{
   const f = e.target.files[0]; if(!f) return;
   const text = await f.text();
   await fetch('/presets/import', {method:'POST', headers:{'Content-Type':'application/json'}, body:text});
-  await loadConfig(); updateBadges();
+  await loadConfig(); await refreshPills();
 });
 async function resetDefaults(btn){
-  const ok = await fetchOK('/presets/reset', {method:'POST'});
-  flashIcon(btn, ok); await loadConfig();
+  await fetchOK('/presets/reset', {method:'POST'}); await loadConfig();
 }
 
-// ----- Chaos panel enable/disable -----
-function chaosApplyDisabled(){
-  const en = document.getElementById('chaos_enabled').checked;
-  const card = document.querySelector('h3+div').parentElement; // not robust; fallback below
-  const panel = document.querySelectorAll('.card')[4]; // Discrepancy card index (rough)
-  const parent = panel || document;
-  parent.querySelectorAll('input,select,button').forEach(el => {
-    const id = el.id||'';
-    if (id==='chaos_enabled' || el.textContent?.includes('Reset Chaos')) return; // keep toggle & reset active
-    if (el.closest('h3')) return;
-    el.disabled = !en;
-  });
-}
-document.addEventListener('change', (e)=>{
-  if (e.target && e.target.id==='chaos_enabled') chaosApplyDisabled();
-});
-
-// ----- Config I/O -----
 async function loadConfig(){
   const cfg = await fetchJSON('/auto/config');
   ENABLE_PIXEL = !!cfg.enable_pixel;
-  document.getElementById('enable_pixel').checked = ENABLE_PIXEL;
-  document.getElementById('enable_capi').checked = !!cfg.enable_capi;
   document.getElementById('rps').value = cfg.rps;
   document.getElementById('p_add_to_cart').value = cfg.p_add_to_cart;
   document.getElementById('p_begin_checkout').value = cfg.p_begin_checkout;
@@ -1124,18 +857,23 @@ async function loadConfig(){
   document.getElementById('kill_AddToCart').checked = !!(cfg.kill_event_types||{})["AddToCart"];
   document.getElementById('kill_InitiateCheckout').checked = !!(cfg.kill_event_types||{})["InitiateCheckout"];
   document.getElementById('kill_Purchase').checked = !!(cfg.kill_event_types||{})["Purchase"];
+  document.getElementById('kill_AppendValue').checked = !!(cfg.kill_event_types||{})["AppendValue"];
   document.getElementById('enable_webhook').checked = !!cfg.enable_webhook;
   document.getElementById('enable_ga4').checked = !!cfg.enable_ga4;
-  document.getElementById('share_event_id_to_capi').checked = !!cfg.share_event_id_to_capi;
-  document.getElementById('share_event_id_to_capi_cfg').checked = !!cfg.share_event_id_to_capi;
-  document.getElementById('chaos_enabled').checked = !!cfg.chaos_enabled;
-  chaosApplyDisabled();
-  updateBadges(); updatePreview();
+
+  document.getElementById('user_signal_em').checked = !!cfg.user_signal_em;
+  document.getElementById('user_signal_ip').checked = !!cfg.user_signal_ip;
+  document.getElementById('user_signal_fbc').checked = !!cfg.user_signal_fbc;
+  document.getElementById('user_signal_fbp').checked = !!cfg.user_signal_fbp;
+  document.getElementById('user_default_email').value = cfg.user_default_email||'';
+  document.getElementById('user_default_fbc').value = cfg.user_default_fbc||'';
+  document.getElementById('user_default_fbp').value = cfg.user_default_fbp||'';
+
+  await refreshPills();
+  updatePreview();
 }
 async function saveConfig(btn){
   const body = {
-    enable_pixel: document.getElementById('enable_pixel').checked,
-    enable_capi: document.getElementById('enable_capi').checked,
     rps: parseFloat(document.getElementById('rps').value||'0.5'),
     p_add_to_cart: parseFloat(document.getElementById('p_add_to_cart').value||'0.35'),
     p_begin_checkout: parseFloat(document.getElementById('p_begin_checkout').value||'0.7'),
@@ -1175,29 +913,36 @@ async function saveConfig(btn){
       AddToCart: document.getElementById('kill_AddToCart').checked,
       InitiateCheckout: document.getElementById('kill_InitiateCheckout').checked,
       Purchase: document.getElementById('kill_Purchase').checked,
+      AppendValue: document.getElementById('kill_AppendValue').checked,
     },
     enable_webhook: document.getElementById('enable_webhook').checked,
     enable_ga4: document.getElementById('enable_ga4').checked,
-    chaos_enabled: document.getElementById('chaos_enabled').checked,
-    share_event_id_to_capi: document.getElementById('share_event_id_to_capi_cfg').checked,
+
+    user_signal_em: document.getElementById('user_signal_em').checked,
+    user_signal_ip: document.getElementById('user_signal_ip').checked,
+    user_signal_fbc: document.getElementById('user_signal_fbc').checked,
+    user_signal_fbp: document.getElementById('user_signal_fbp').checked,
+    user_default_email: document.getElementById('user_default_email').value||'',
+    user_default_fbc: document.getElementById('user_default_fbc').value||'',
+    user_default_fbp: document.getElementById('user_default_fbp').value||'',
   };
-  const ok = await fetchOK('/auto/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
-  flashIcon(btn, ok);
-  if (ok) setTimeout(refreshStatus, 250);
-  updateBadges(); updatePreview();
-}
-function updateBadges(){
-  fetchJSON('/auto/config').then(cfg => {
-    document.getElementById('badge_pixel').textContent = 'Pixel: ' + (cfg.enable_pixel?'on':'off');
-    document.getElementById('badge_capi').textContent  = 'CAPI: ' + (cfg.enable_capi?'on':'off');
-    document.getElementById('badge_seed').textContent  = 'Seed: ' + (cfg.seed?cfg.seed:'none');
-    document.getElementById('badge_preset').textContent= 'Preset: ' + (cfg.active_preset||'Default');
-  }).catch(()=>{});
+  await fetchOK('/auto/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  await refreshStatus(); await refreshPills(); updatePreview();
 }
 
-// ----- Metrics polling (spark + dedup) -----
-const sparkSent = document.getElementById('spark_sent').getContext('2d');
-const sparkPur  = document.getElementById('spark_pur').getContext('2d');
+function updatePreview(){
+  const price = 68.99, qty = 2, total = 149.02;
+  const p = { contents:[{id:'SKU-10057',quantity:qty,item_price:price}], currency: currentCurrency('pixel'), value: total };
+  attachMarginPltv(p, null);
+  document.getElementById('previewBox').textContent = JSON.stringify(p, null, 2);
+}
+
+const sparkSent = (function(){ const c=document.createElement('canvas'); c.width=120; c.height=36; return c; })();
+const ctxA = sparkSent.getContext('2d');
+const sparkPur = (function(){ const c=document.createElement('canvas'); c.width=120; c.height=36; return c; })();
+const ctxB = sparkPur.getContext('2d');
+document.getElementById('spark_sent').getContext('2d').drawImage(sparkSent,0,0);
+document.getElementById('spark_pur').getContext('2d').drawImage(sparkPur,0,0);
 let sA=[], sB=[];
 function drawSpark(ctx, arr){
   ctx.clearRect(0,0,120,36);
@@ -1217,13 +962,14 @@ async function pollMetrics(){
     const m = await fetchJSON('/metrics');
     sA.push(m.sent_total||0); if (sA.length>30) sA=sA.slice(-30);
     sB.push(m.purchases||0); if (sB.length>30) sB=sB.slice(-30);
-    drawSpark(sparkSent, sA); drawSpark(sparkPur, sB);
+    drawSpark(ctxA, sA); drawSpark(ctxB, sB);
+    document.getElementById('spark_sent').getContext('2d').drawImage(sparkSent,0,0);
+    document.getElementById('spark_pur').getContext('2d').drawImage(sparkPur,0,0);
     document.getElementById('dedup').textContent = `Dedup matched: ${m.dedup.matched} | pixel-only: ${m.dedup.pixel_only} | capi-only: ${m.dedup.capi_only}`;
   } catch(e) {}
 }
 setInterval(pollMetrics, 1000);
 
-// ----- Event console -----
 async function refreshConsole(btn){
   const ch = document.getElementById('f_channel').value;
   const ty = document.getElementById('f_type').value;
@@ -1246,67 +992,103 @@ async function refreshConsole(btn){
       <tbody>${rows}</tbody>
     </table>`;
 }
+async function resetMetrics(btn){ await fetchOK('/metrics/reset', {method:'POST'}); await refreshConsole(); }
 
-// ----- Scenario runner -----
-async function runScenario(btn){
-  const text = document.getElementById('scenario_text').value||'';
-  document.getElementById('scenario_status').textContent = 'Running...';
-  const ok = await fetchOK('/scenario/run', {method:'POST', headers:{'Content-Type':'application/json'}, body:text});
-  flashIcon(btn, ok);
-  document.getElementById('scenario_status').textContent = ok ? 'Scenario started.' : 'Error.';
+async function resetChaos(btn){ await fetchOK('/chaos/reset', {method:'POST'}); await loadConfig(); }
+
+async function appendPreview(btn){
+  const types = Array.from(document.getElementById('av_types').selectedOptions).map(o=>o.value);
+  const q = new URLSearchParams();
+  if(types.length) q.set('types', types.join(','));
+  q.set('lookback_days', document.getElementById('av_base_lookback').value||'7');
+  const j = await fetchJSON('/appendvalue/preview?'+q.toString());
+  document.getElementById('av_status').textContent = `Targets: ${j.count} base events (showing up to ${j.sample.length}).`;
+}
+async function appendStart(btn){
+  const types = Array.from(document.getElementById('av_types').selectedOptions).map(o=>o.value);
+  const body = {
+    types, 
+    base_lookback_days: parseInt(document.getElementById('av_base_lookback').value||'7',10),
+    days_min: parseInt(document.getElementById('av_days_min').value||'0',10),
+    days_max: parseInt(document.getElementById('av_days_max').value||'7',10),
+    new_total_min: parseFloat(document.getElementById('av_new_total_min').value||'120'),
+    new_total_max: parseFloat(document.getElementById('av_new_total_max').value||'600'),
+    rps: parseFloat(document.getElementById('av_rps').value||'0.5'),
+    duration_sec: parseInt(document.getElementById('av_dur').value||'30',10),
+    isolation: document.getElementById('iso_append_only').checked
+  };
+  const ok = await fetchOK('/appendvalue/start', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  document.getElementById('av_status').textContent = ok ? 'Append stream started.' : 'Error';
+}
+async function appendStop(btn){
+  await fetchOK('/appendvalue/stop', {method:'POST'});
+  document.getElementById('av_status').textContent = 'Stopped.';
 }
 
-// ----- Replay -----
-async function downloadReplay(){
-  const j = await fetchJSON('/replay/export');
-  const blob = new Blob([JSON.stringify(j,null,2)], {type:'application/json'});
-  const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'replay_bundle.json'; a.click();
-}
-
-// ----- Chaos Reset -----
-async function resetChaos(btn){
-  const ok = await fetchOK('/chaos/reset', {method:'POST'});
-  flashIcon(btn, ok);
-  if (ok) await loadConfig();
-}
-
-// ----- Init -----
 window.addEventListener('load', async () => {
-  await loadConfig(); updatePreview(); refreshStatus(); pollMetrics(); refreshConsole();
-  pxRefreshStatus(); // initialize Pixel Auto controls
-  if (document.getElementById('enable_pixel').checked) { try { fbq('track','PageView'); } catch(e){} }
+  await loadConfig(); updatePreview(); await refreshStatus(); await refreshConsole(); await refreshPills(); pxRefreshStatus();
+  try { fbq('track','PageView'); } catch(e){}
 });
 </script>
 <noscript><img height="1" width="1" style="display:none" src="https://www.facebook.com/tr?id=__PIXEL_ID__&ev=PageView&noscript=1"/></noscript>
 </div></body></html>
-"""
+'''
 
-# -------------------- Routes: HTML --------------------
+from flask import Flask, request, Response, jsonify
+# HTML route
 @app.route("/")
 def home():
     banners = banner_html()
-    test_onoff = "on" if TEST_EVENT_CODE else "off"
     ga4_onoff = "on" if GA4_URL else "off"
     file_sink_label = FILE_SINK_PATH if FILE_SINK_PATH else "(disabled — set FILE_SINK_PATH env)"
     html = (
-        PAGE_HTML_HEAD
-        + PAGE_HTML_BODY_PREFIX
+        page_head
+        + page_body
             .replace("__APP_VERSION__", APP_VERSION)
             .replace("__BANNERS__", banners)
-            .replace("__TEST_ONOFF__", test_onoff)
             .replace("__GA4_ONOFF__", ga4_onoff)
             .replace("__FILE_SINK_LABEL__", file_sink_label)
-        + PAGE_HTML_FOOT
+        + page_foot
             .replace("__PIXEL_ID__", PIXEL_ID or "")
     )
     return Response(html, mimetype="text/html")
 
-# -------------------- Metrics endpoints --------------------
+@app.post("/toggle/pixel")
+def toggle_pixel():
+    try:
+        on = bool((request.get_json(force=True) or {}).get("on"))
+    except Exception:
+        return {"ok": False}, 400
+    with CONFIG_LOCK:
+        CONFIG["enable_pixel"] = on
+    return {"ok": True, "enable_pixel": on}
+
+@app.post("/toggle/capi")
+def toggle_capi():
+    try:
+        on = bool((request.get_json(force=True) or {}).get("on"))
+    except Exception:
+        return {"ok": False}, 400
+    with CONFIG_LOCK:
+        CONFIG["enable_capi"] = on
+    if on: 
+        auto_start()
+    else:
+        auto_stop()
+    return {"ok": True, "enable_capi": on}
+
+@app.post("/toggle/testcode")
+def toggle_testcode():
+    try:
+        code = (request.get_json(force=True) or {}).get("code","")
+    except Exception:
+        code = ""
+    with CONFIG_LOCK:
+        CONFIG["test_event_code"] = (code or "").strip()
+    return {"ok": True, "test_event_code": CONFIG["test_event_code"]}
+
 @app.post("/metrics/pixel")
 def metrics_pixel():
-    """Client pings here when it fires a Pixel event so we can power dedup & diff.
-       If share_event_id_to_capi is enabled, forward to CAPI with same event_id.
-    """
     try:
         body = request.get_json(force=True) or {}
     except Exception:
@@ -1316,43 +1098,21 @@ def metrics_pixel():
     sent = body.get("sent") or {}
     eid = body.get("event_id")
     dropped = bool(body.get("dropped"))
-    diff = {"value": {"intended": intended.get("value"), "sent": sent.get("value")},
-            "currency": {"intended": intended.get("currency"), "sent": sent.get("currency")}}
-    entry = {
-        "ts": now_iso(), "channel":"pixel", "event_name":name, "ok": (not dropped),
-        "intended": intended, "sent": sent, "response": {"dropped": dropped}, "event_id": eid, "diff": diff
-    }
-    _log_event(entry)
-    _ndjson_append({"channel":"pixel","event":entry})
+    for k in ("fbc","fbp"):
+        v = (body.get(k) or "").strip()
+        if v:
+            LAST_USERDATA[k] = v
+    diff = {"value": {"intended": intended.get("value"), "sent": sent.get("value")}, "currency":{"intended": intended.get("currency"),"sent": sent.get("currency")}}
+    entry = {"ts": now_iso(), "channel":"pixel", "event_name":name, "ok": (not dropped), "intended": intended, "sent": sent, "response": {"dropped": dropped}, "event_id": eid, "diff": diff}
+    _log_event(entry); _ndjson_append({"channel":"pixel","event":entry})
+    return {"ok": True}
 
-    # Forward to CAPI for dedup if enabled and not dropped
-    cfg = get_cfg_snapshot()
-    if (not dropped) and cfg.get("share_event_id_to_capi"):
-        try:
-            ev = {
-                "event_name": name,
-                "event_time": int(time.time()),
-                "event_id": eid,
-                "action_source": "website",
-                "event_source_url": BASE_URL,
-                "user_data": _collect_user_data_for_capi(cfg),
-                "custom_data": sent if isinstance(sent, dict) else {}
-            }
-            resp = capi_post([ev], cfg)
-            loge = {
-                "ts": now_iso(), "channel":"capi", "event_name": name,
-                "intended": {"forwarded_from":"pixel", "pixel_sent": sent},
-                "sent": ev, "response": resp, "ok": True, "event_id": eid
-            }
-            _log_event(loge)
-            _ndjson_append({"channel":"capi","event":loge})
-        except requests.HTTPError as e:
-            loge = {"ts": now_iso(), "channel":"capi", "event_name": name, "intended": {}, "sent": {}, "response":{"error":str(e)}, "ok": False, "event_id": eid}
-            _log_event(loge)
-        except Exception as e:
-            loge = {"ts": now_iso(), "channel":"capi", "event_name": name, "intended": {}, "sent": {}, "response":{"error":str(e)}, "ok": False, "event_id": eid}
-            _log_event(loge)
-
+@app.post("/metrics/reset")
+def metrics_reset():
+    with METRICS_LOCK:
+        EVENT_LOG.clear(); COUNTS.clear()
+        DEDUP["pixel_ids"].clear(); DEDUP["capi_ids"].clear()
+        DEDUP["matched"]=DEDUP["pixel_only"]=DEDUP["capi_only"]=0
     return {"ok": True}
 
 @app.get("/metrics")
@@ -1362,11 +1122,7 @@ def metrics():
             "sent_total": COUNTS.get("sent_capi",0) + COUNTS.get("sent_pixel",0),
             "purchases": COUNTS.get("sent_capi_Purchase",0) + COUNTS.get("sent_pixel_Purchase",0),
             "errors": COUNTS.get("errors",0),
-            "dedup": {
-                "matched": DEDUP["matched"],
-                "pixel_only": DEDUP["pixel_only"],
-                "capi_only": DEDUP["capi_only"]
-            }
+            "dedup": {"matched": DEDUP["matched"], "pixel_only": DEDUP["pixel_only"], "capi_only": DEDUP["capi_only"]}
         }
     return jsonify(out)
 
@@ -1386,7 +1142,6 @@ def api_events():
         out.append(e)
     return jsonify({"items": out[:200]})
 
-# -------------------- Presets & seed --------------------
 PRESETS_DIR = ".presets"
 os.makedirs(PRESETS_DIR, exist_ok=True)
 
@@ -1401,17 +1156,7 @@ def set_seed():
     reseed()
     return {"ok": True}
 
-@app.post("/config/share_eid")
-def set_share_eid():
-    try:
-        share = bool((request.get_json(force=True) or {}).get("share", False))
-    except Exception:
-        share = False
-    with CONFIG_LOCK:
-        CONFIG["share_event_id_to_capi"] = share
-    return {"ok": True, "share_event_id_to_capi": share}
-
-DEFAULT_CONFIG = json.loads(json.dumps(CONFIG))  # snapshot of boot defaults
+DEFAULT_CONFIG = json.loads(json.dumps(CONFIG))
 
 def _preset_path(name:str) -> str:
     safe = "".join(c for c in name if c.isalnum() or c in ("-","_")).strip() or "Preset"
@@ -1422,8 +1167,7 @@ def presets_save():
     name = request.args.get("name","Preset")
     path = _preset_path(name)
     with CONFIG_LOCK:
-        cfg = dict(CONFIG)
-        cfg["active_preset"] = name
+        cfg = dict(CONFIG); cfg["active_preset"] = name
     with open(path,"w",encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     return {"ok": True, "name": name}
@@ -1476,110 +1220,107 @@ def presets_reset():
     reseed()
     return {"ok": True, "config": get_cfg_snapshot()}
 
-# -------------------- Auto stream --------------------
 _auto_thread = None
 _stop_evt = threading.Event()
 
 def _event_base(session, **extra):
-    return {
-        "event_id": _uid(),
-        "timestamp": now_iso(),
-        "user": {
-            "user_id": session["user_id"],
-            "session_id": session["session_id"],
-            "device": session["device"],
-            "country": session["country"],
-            "source": session["source"],
-            "utm_campaign": session["utm_campaign"],
-        },
-        "context": {"currency": session["currency"], "store_id": session["store_id"]},
-        **extra
-    }
+    return {"event_id": _uid(), "timestamp": now_iso(), "user": {"user_id": session["user_id"], "session_id": session["session_id"], "device": session["device"], "country": session["country"], "source": session["source"], "utm_campaign": session["utm_campaign"]}, "context": {"currency": session["currency"], "store_id": session["store_id"]}, **extra}
+
+def capi_post(server_events, cfg):
+    if not cfg.get("enable_capi"):
+        return {"skipped": True, "reason": "enable_capi=false"}
+    if not PIXEL_ID or not ACCESS_TOKEN:
+        return {"skipped": True, "reason": "missing_capi_config"}
+    if cfg.get("isolation_appendvalue_only"):
+        names = {e.get("event_name") for e in server_events}
+        if any(n and n != "AppendValue" for n in names):
+            return {"skipped": True, "reason": "isolation_appendvalue_only"}
+    lat = int(cfg.get("net_capi_latency_ms", 0))
+    if lat > 0: time.sleep(lat/1000.0)
+    if rand_uniform(0.0, 1.0) < float(cfg.get("net_capi_error_rate", 0.0)):
+        class Dummy: status_code=503; text="Simulated upstream error"
+        raise requests.HTTPError("503 Simulated", response=Dummy())
+    payload = {"data": server_events}
+    test_code = (cfg.get("test_event_code") or "").strip()
+    if test_code: payload["test_event_code"] = test_code
+    url = f"{CAPI_URL_BASE}/{PIXEL_ID}/events"
+    r = requests.post(url, params={"access_token": ACCESS_TOKEN}, json=payload, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+def webhook_post(server_events, cfg):
+    if not cfg.get("enable_webhook"): return {"skipped": True}
+    if not WEBHOOK_URL: return {"skipped": True, "reason":"missing_webhook_url"}
+    try:
+        r = requests.post(WEBHOOK_URL, headers=WEBHOOK_HEADERS, json={"events": server_events}, timeout=10)
+        return {"status": r.status_code, "ok": r.ok}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+def ga4_post(mapped_events, cfg):
+    if not cfg.get("enable_ga4"): return {"skipped": True}
+    if not GA4_URL: return {"skipped": True, "reason":"missing_ga4_config"}
+    body = {"client_id": str(uuid.uuid4()), "events": mapped_events}
+    try:
+        r = requests.post(GA4_URL, json=body, timeout=10)
+        return {"status": r.status_code, "ok": r.ok, "text": r.text[:300]}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 def _send_one_through_sinks(sim_evt, cfg):
-    capi_events = map_sim_event_to_capi(sim_evt, cfg)
-    ga4_events  = map_sim_event_to_ga4(sim_evt, cfg) if cfg.get("enable_ga4") else []
-
+    if cfg.get("isolation_appendvalue_only") and sim_evt.get("event_type") != "append_value":
+        return
+    capi_events = map_sim_event_to_capi(sim_evt, cfg) if sim_evt.get("event_type") != "append_value" else []
+    ga4_events  = map_sim_event_to_ga4(sim_evt, cfg) if (cfg.get("enable_ga4") and sim_evt.get("event_type") != "append_value") else []
     kill = cfg.get("kill_event_types", {})
     for ev in capi_events:
-        if kill.get(ev.get("event_name",""), False):
-            return
-
-    lag = float(cfg.get("lag_capi_seconds", 0.0) if cfg.get("chaos_enabled") else 0.0)
+        if kill.get(ev.get("event_name",""), False): return
+    lag = float(cfg.get("lag_capi_seconds", 0.0))
     if lag > 0: time.sleep(max(0.0, lag))
-
-    # Post CAPI
-    resp = None
-    ok = True
     if capi_events:
-        try:
-            resp = capi_post(capi_events, cfg)
-            ok = True
-        except requests.HTTPError as e:
-            resp = {"error": str(e), "text": getattr(e.response,'text','')[:400]}
-            ok = False
-        except Exception as e:
-            resp = {"error": str(e)}
-            ok = False
-
-        for ev in capi_events:
-            entry = {
-                "ts": now_iso(), "channel":"capi", "event_name": ev.get("event_name"),
-                "intended": sim_evt, "sent": ev, "response": resp, "ok": ok, "event_id": ev.get("event_id")
-            }
-            _log_event(entry)
-            _ndjson_append({"channel":"capi","event":entry})
-
-    # webhook sink
+        _post_capi_and_log(capi_events, sim_evt, cfg)
     if capi_events and cfg.get("enable_webhook"):
         wresp = webhook_post(capi_events, cfg)
-        entry = {
-            "ts": now_iso(), "channel":"webhook", "event_name": capi_events[0].get("event_name") if capi_events else "",
-            "intended": sim_evt, "sent": {"events": capi_events}, "response": wresp, "ok": bool(wresp.get("ok", True))
-        }
-        _log_event(entry)
-        _ndjson_append({"channel":"webhook","event":entry})
-
-    # GA4 sink
+        entry = {"ts": now_iso(), "channel":"webhook", "event_name": capi_events[0].get("event_name") if capi_events else "", "intended": sim_evt, "sent": {"events": capi_events}, "response": wresp, "ok": bool(wresp.get("ok", True))}
+        _log_event(entry); _ndjson_append({"channel":"webhook","event":entry})
     if ga4_events:
         gresp = ga4_post(ga4_events, cfg)
-        entry = {
-            "ts": now_iso(), "channel":"ga4", "event_name": ga4_events[0].get("name") if ga4_events else "",
-            "intended": sim_evt, "sent": {"events": ga4_events}, "response": gresp, "ok": bool(gresp.get("ok", True))
-        }
-        _log_event(entry)
-        _ndjson_append({"channel":"ga4","event":entry})
+        entry = {"ts": now_iso(), "channel":"ga4", "event_name": ga4_events[0].get("name") if ga4_events else "", "intended": sim_evt, "sent": {"events": ga4_events}, "response": gresp, "ok": bool(gresp.get("ok", True))}
+        _log_event(entry); _ndjson_append({"channel":"ga4","event":entry})
+
+def _post_capi_and_log(capi_events, sim_evt, cfg):
+    resp=None; ok=True
+    if capi_events:
+        try:
+            resp=capi_post(capi_events, cfg); ok=True
+        except requests.HTTPError as e:
+            resp={"error": str(e), "text": getattr(e.response,'text','')[:400]}; ok=False
+        except Exception as e:
+            resp={"error": str(e)}; ok=False
+        for ev in capi_events:
+            entry={"ts": now_iso(), "channel":"capi", "event_name": ev.get("event_name"), "intended": sim_evt, "sent": ev, "response": resp, "ok": ok, "event_id": ev.get("event_id")}
+            _log_event(entry); _ndjson_append({"channel":"capi","event":entry})
 
 def _send_simulated_session_once(cfg):
-    s = _make_session(cfg)
-    product = _make_product(cfg)
-
+    s = _make_session(cfg); product = _make_product(cfg)
     for evt in [
         _event_base(s, event_type="page_view", page=rand_choice(["/","/home","/sale"])),
         _event_base(s, event_type="product_view", product=product),
     ]:
         _send_one_through_sinks(evt, cfg)
-
     if _rng.random() < cfg["p_add_to_cart"]:
         qty = rand_choice([1,1,1,2])
         line = {"product_id": product["product_id"], "qty": qty, "price": product["price"]}
         evt = _event_base(s, event_type="add_to_cart", line_item=line, cart_size=1)
         _send_one_through_sinks(evt, cfg)
-
         if _rng.random() < cfg["p_begin_checkout"]:
-            subtotal = qty * product["price"]
-            shipping = 0.0 if subtotal >= cfg["free_shipping_threshold"] else (rand_choice(cfg["shipping_options"]) if cfg["shipping_options"] else 0.0)
-            tax = round(cfg["tax_rate"] * subtotal, 2)
-            total = round(subtotal + shipping + tax, 2)
-            cart = [line]
-            evt = _event_base(s, event_type="begin_checkout", cart=cart, subtotal=round(subtotal,2),
-                              shipping=shipping, tax=tax, total=total)
+            subtotal=qty*product["price"]; shipping = 0.0 if subtotal >= cfg["free_shipping_threshold"] else (rand_choice(cfg["shipping_options"]) if cfg["shipping_options"] else 0.0)
+            tax=round(cfg["tax_rate"]*subtotal,2)
+            total=round(subtotal+shipping+tax,2); cart=[line]
+            evt=_event_base(s, event_type="begin_checkout", cart=cart, subtotal=round(subtotal,2), shipping=shipping, tax=tax, total=total)
             _send_one_through_sinks(evt, cfg)
-
             if _rng.random() < cfg["p_purchase"]:
-                evt = _event_base(s, event_type="purchase", items=cart, subtotal=round(subtotal,2),
-                                  shipping=shipping, tax=tax, total=total,
-                                  order_id="o_"+_uid()[:12], payment_method=rand_choice(["card","paypal","apple_pay","google_pay","klarna"]))
+                evt=_event_base(s, event_type="purchase", items=cart, subtotal=round(subtotal,2), shipping=shipping, tax=tax, total=total, order_id="o_"+_uid()[:12], payment_method=rand_choice(["card","paypal","apple_pay","google_pay","klarna"]))
                 _send_one_through_sinks(evt, cfg)
 
 def _auto_loop():
@@ -1587,10 +1328,8 @@ def _auto_loop():
         cfg = get_cfg_snapshot()
         start = time.time()
         try:
-            if cfg.get("enable_capi"):
-                _send_simulated_session_once(cfg)
-        except Exception:
-            pass
+            if cfg.get("enable_capi"): _send_simulated_session_once(cfg)
+        except Exception: pass
         delay = max(0.05, 1.0 / max(0.1, cfg["rps"]))
         elapsed = time.time() - start
         _stop_evt.wait(max(0.0, delay - elapsed))
@@ -1600,37 +1339,28 @@ def auto_start():
     global _auto_thread
     q = request.args.get("rps")
     if q is not None:
-        with CONFIG_LOCK:
-            CONFIG["rps"] = clampf(q, 0.1, 10.0, CONFIG["rps"])
+        with CONFIG_LOCK: CONFIG["rps"] = clampf(q, 0.1, 10.0, CONFIG["rps"])
     if _auto_thread is not None and _auto_thread.is_alive():
-        with CONFIG_LOCK:
-            return jsonify({"ok": True, "running": True, "rps": round(CONFIG["rps"],2)})
-    _stop_evt.clear()
-    _auto_thread = threading.Thread(target=_auto_loop, daemon=True)
-    _auto_thread.start()
-    with CONFIG_LOCK:
-        return jsonify({"ok": True, "running": True, "rps": round(CONFIG["rps"],2)})
+        with CONFIG_LOCK: return jsonify({"ok": True, "running": True, "rps": round(CONFIG["rps"],2)})
+    _stop_evt.clear(); _auto_thread = threading.Thread(target=_auto_loop, daemon=True); _auto_thread.start()
+    with CONFIG_LOCK: return jsonify({"ok": True, "running": True, "rps": round(CONFIG["rps"],2)})
 
 @app.get("/auto/stop")
 def auto_stop():
     global _auto_thread
     _stop_evt.set()
     if _auto_thread is not None:
-        _auto_thread.join(timeout=1.0)
-        _auto_thread = None
+        _auto_thread.join(timeout=1.0); _auto_thread = None
     return jsonify({"ok": True, "running": False})
 
 @app.get("/auto/status")
 def auto_status():
     running = _auto_thread is not None and _auto_thread.is_alive()
-    with CONFIG_LOCK:
-        rps = round(CONFIG["rps"], 2)
+    with CONFIG_LOCK: rps = round(CONFIG["rps"], 2)
     return jsonify({"ok": True, "running": running, "rps": rps})
 
-# -------------------- /ingest forwarder (client → server → CAPI) --------------------
 @app.post("/ingest")
 def ingest():
-    """Accept a single sim event and forward to CAPI/sinks."""
     try:
         sim_event = request.get_json(force=True)
     except Exception:
@@ -1642,55 +1372,26 @@ def ingest():
     except Exception as e:
         return {"ok": False, "error": str(e)}, 500
 
-# -------------------- Chaos reset --------------------
-@app.post("/chaos/reset")
-def chaos_reset():
-    with CONFIG_LOCK:
-        CONFIG["mismatch_value_pct"] = 0.0
-        CONFIG["mismatch_currency"] = "NONE"
-        CONFIG["desync_event_id"] = False
-        CONFIG["duplicate_event_id_n"] = 0
-        CONFIG["drop_pixel_every_n"] = 0
-        CONFIG["lag_capi_seconds"] = 0.0
-        CONFIG["net_capi_latency_ms"] = 0
-        CONFIG["net_capi_error_rate"] = 0.0
-        CONFIG["schema_remove_contents"] = False
-        CONFIG["schema_empty_arrays"] = False
-        CONFIG["schema_str_numbers"] = False
-        CONFIG["schema_unknown_fields"] = False
-        CONFIG["clock_skew_seconds"] = 0
-        # keep chaos_enabled as-is (toggle stays clickable)
-    return {"ok": True, "config": get_cfg_snapshot()}
-
-# -------------------- Config endpoints --------------------
-@app.route("/auto/config", methods=["GET", "POST"])
+@app.route("/auto/config", methods=["GET","POST"])
 def auto_config():
     if request.method == "GET":
-        with CONFIG_LOCK:
-            return jsonify(CONFIG)
-
+        with CONFIG_LOCK: return jsonify(CONFIG)
     try:
         body = request.get_json(force=True) or {}
     except Exception:
         return jsonify({"ok": False, "error":"invalid json"}), 400
-
     with CONFIG_LOCK:
-        # master
-        for k in ("enable_pixel","enable_capi","enable_webhook","enable_ga4","append_margin","append_pltv","null_price","null_currency","null_event_id","desync_event_id","schema_remove_contents","schema_empty_arrays","schema_str_numbers","schema_unknown_fields","chaos_enabled","share_event_id_to_capi"):
+        for k in ("enable_pixel","enable_capi","enable_webhook","enable_ga4","append_margin","append_pltv","null_price","null_currency","null_event_id","desync_event_id","schema_remove_contents","schema_empty_arrays","schema_str_numbers","schema_unknown_fields","user_signal_em","user_signal_ip","user_signal_fbc","user_signal_fbp","isolation_appendvalue_only"):
             if k in body: CONFIG[k] = to_bool(body[k], CONFIG.get(k,False))
-        # traffic
         if "rps" in body: CONFIG["rps"] = clampf(body["rps"], 0.1, 10.0, CONFIG["rps"])
         for k in ("p_add_to_cart","p_begin_checkout","p_purchase"):
             if k in body: CONFIG[k] = clampf(body[k], 0.0, 1.0, CONFIG[k])
-        # catalog/pricing
         if "product_catalog_size" in body: CONFIG["product_catalog_size"] = clampp(body["product_catalog_size"], 1, 100000, CONFIG["product_catalog_size"])
         if "price_min" in body: CONFIG["price_min"] = clampf(body["price_min"], 0.0, 1e6, CONFIG["price_min"])
         if "price_max" in body: CONFIG["price_max"] = clampf(body["price_max"], max(0.01, CONFIG["price_min"]), 1e6, CONFIG["price_max"])
-        # currency
         if "currency_override" in body:
             v = str(body["currency_override"]).upper()
             CONFIG["currency_override"] = v if v in _ALLOWED_CURRENCIES else CONFIG["currency_override"]
-        # economics
         if "free_shipping_threshold" in body: CONFIG["free_shipping_threshold"] = clampf(body["free_shipping_threshold"], 0.0, 1e6, CONFIG["free_shipping_threshold"])
         if "shipping_options" in body:
             arr = body["shipping_options"] or []
@@ -1698,13 +1399,10 @@ def auto_config():
             for v in arr:
                 try:
                     fv = float(v)
-                    if fv >= 0:
-                        cleaned.append(round(fv, 2))
-                except Exception:
-                    pass
+                    if fv >= 0: cleaned.append(round(fv, 2))
+                except Exception: pass
             if cleaned: CONFIG["shipping_options"] = cleaned
         if "tax_rate" in body: CONFIG["tax_rate"] = clampf(body["tax_rate"], 0.0, 1.0, CONFIG["tax_rate"])
-        # margin + PLTV
         if "cost_pct_min" in body: CONFIG["cost_pct_min"] = clampf(body["cost_pct_min"], 0.0, 1.0, CONFIG["cost_pct_min"])
         if "cost_pct_max" in body:
             proposed = clampf(body["cost_pct_max"], CONFIG["cost_pct_min"], 1.0, CONFIG["cost_pct_max"])
@@ -1713,7 +1411,6 @@ def auto_config():
         if "pltv_max" in body:
             proposed = clampf(body["pltv_max"], CONFIG["pltv_min"], 1e7, CONFIG["pltv_max"])
             CONFIG["pltv_max"] = max(proposed, CONFIG["pltv_min"])
-        # discrepancies/chaos
         for k in ("mismatch_value_pct","lag_capi_seconds","net_capi_error_rate"):
             if k in body: CONFIG[k] = clampf(body[k], 0.0, 10.0, CONFIG[k])
         for k in ("duplicate_event_id_n","drop_pixel_every_n","net_capi_latency_ms","clock_skew_seconds"):
@@ -1724,78 +1421,136 @@ def auto_config():
         if "kill_event_types" in body:
             d = body["kill_event_types"] or {}
             keep = {}
-            for name in ("PageView","ViewContent","AddToCart","InitiateCheckout","Purchase","ReturnInitiated"):
+            for name in ("PageView","ViewContent","AddToCart","InitiateCheckout","Purchase","ReturnInitiated","AppendValue"):
                 keep[name] = to_bool(d.get(name, CONFIG["kill_event_types"].get(name, False)))
             CONFIG["kill_event_types"] = keep
-
+        for k in ("user_default_email","user_default_fbc","user_default_fbp"):
+            if k in body and isinstance(body[k], str): CONFIG[k] = body[k].strip()
     return jsonify({"ok": True, "config": get_cfg_snapshot()})
 
-# -------------------- Scenario runner --------------------
-_sc_thread = None
-def _scenario_loop(steps: List[Dict[str,Any]]):
-    cfg = get_cfg_snapshot()
-    s = _make_session(cfg)
-    product = _make_product(cfg)
-    for step in steps:
-        if "wait" in step:
-            try:
-                time.sleep(max(0.0, float(step["wait"])));
-            except Exception:
-                pass
-            continue
-        if "page_view" in step:
-            _send_one_through_sinks(_event_base(s, event_type="page_view", page=step["page_view"].get("url","/")), cfg)
-        if "product_view" in step:
-            _send_one_through_sinks(_event_base(s, event_type="product_view", product=product), cfg)
-        if "add_to_cart" in step:
-            qty = int(step["add_to_cart"].get("qty",1)); line = {"product_id": product["product_id"], "qty": qty, "price": product["price"]}
-            _send_one_through_sinks(_event_base(s, event_type="add_to_cart", line_item=line, cart_size=1), cfg)
-        if "begin_checkout" in step or "purchase" in step:
-            qty = 1
-            subtotal = qty * product["price"]
-            shipping = 0.0 if subtotal >= cfg["free_shipping_threshold"] else (rand_choice(cfg["shipping_options"]) if cfg["shipping_options"] else 0.0)
-            tax = round(cfg["tax_rate"] * subtotal, 2)
-            total = round(subtotal + shipping + tax, 2)
-            cart = [{"product_id": product["product_id"], "qty": qty, "price": product["price"]}]
-            if "begin_checkout" in step:
-                _send_one_through_sinks(_event_base(s, event_type="begin_checkout", cart=cart, subtotal=round(subtotal,2), shipping=shipping, tax=tax, total=total), cfg)
-            if "purchase" in step:
-                _send_one_through_sinks(_event_base(s, event_type="purchase", items=cart, subtotal=round(subtotal,2),
-                                  shipping=shipping, tax=tax, total=total, order_id="o_"+_uid()[:12]), cfg)
-
-@app.post("/scenario/run")
-def scenario_run():
-    global _sc_thread
-    try:
-        body = request.get_json(force=True) or {}
-    except Exception:
-        return {"ok": False, "error":"invalid json"}, 400
-    steps = body.get("steps", [])
-    if not isinstance(steps, list):
-        return {"ok": False, "error":"bad steps"}, 400
-    t = threading.Thread(target=_scenario_loop, args=(steps,), daemon=True)
-    t.start()
-    _sc_thread = t
+@app.post("/chaos/reset")
+def chaos_reset():
+    with CONFIG_LOCK:
+        CONFIG["mismatch_value_pct"]=0.0; CONFIG["mismatch_currency"]="NONE"; CONFIG["desync_event_id"]=False
+        CONFIG["duplicate_event_id_n"]=0; CONFIG["drop_pixel_every_n"]=0; CONFIG["lag_capi_seconds"]=0.0
+        CONFIG["net_capi_latency_ms"]=0; CONFIG["net_capi_error_rate"]=0.0
+        CONFIG["schema_remove_contents"]=False; CONFIG["schema_empty_arrays"]=False; CONFIG["schema_str_numbers"]=False; CONFIG["schema_unknown_fields"]=False
+        CONFIG["clock_skew_seconds"]=0
+        for k in list(CONFIG["kill_event_types"].keys()): CONFIG["kill_event_types"][k]=False
     return {"ok": True}
 
-# -------------------- Replay export --------------------
+_av_thread = None
+_av_stop = threading.Event()
+
+def _iter_base_events(types, lookback_days):
+    cutoff = datetime.now(tz=timezone.utc) - timedelta(days=max(0,int(lookback_days)))
+    names = set(types or [])
+    with METRICS_LOCK: items = list(EVENT_LOG)
+    for e in items:
+        if e.get("channel") != "capi": continue
+        en = e.get("event_name") or ""
+        if names and en not in names: continue
+        try:
+            sent = e.get("sent") or {}; base_ts = int(sent.get("event_time") or 0)
+            if base_ts <= 0: continue
+            if datetime.fromtimestamp(base_ts, tz=timezone.utc) < cutoff: continue
+            yield e
+        except Exception: continue
+
+def _build_appendvalue_event(base_entry, cfg, new_total, days_offset):
+    sent = base_entry.get("sent") or {}
+    original_name = sent.get("event_name") or base_entry.get("event_name")
+    original_eid  = sent.get("event_id") or base_entry.get("event_id")
+    original_time = int(sent.get("event_time") or time.time())
+    original_cd   = sent.get("custom_data") or {}
+    cur = original_cd.get("currency") or "USD"
+    event_time = original_time + int(days_offset)*24*3600
+    sess = {"user_id": "append_"+(original_eid or "unknown")}
+    user_data = _compile_user_data(sess, cfg)
+    delta=None
+    try:
+        prev=float(original_cd.get("value",0.0)); delta=round(float(new_total)-prev,2)
+    except Exception: pass
+    ev = {
+        "event_name": "AppendValue", "event_time": event_time, "event_id": original_eid,
+        "action_source": "website", "event_source_url": sent.get("event_source_url") or (BASE_URL.rstrip("/") + "/"),
+        "user_data": user_data, "opt_out": True,
+        "custom_data": {"currency": cur, "new_total": round(float(new_total),2)},
+        "original_event_data": {"event_name": original_name, "event_time": original_time}
+    }
+    if delta is not None: ev["custom_data"]["delta_value"]=delta
+    return ev
+
+def _appendvalue_loop(params):
+    cfg = get_cfg_snapshot()
+    types = params.get("types") or []
+    lookback = int(params.get("base_lookback_days") or 7)
+    dmin = int(params.get("days_min") or 0); dmax = int(params.get("days_max") or 7)
+    vmin = float(params.get("new_total_min") or 120.0); vmax = float(params.get("new_total_max") or max(120.0, vmin))
+    rps = max(0.1, float(params.get("rps") or 0.5)); dur = max(1, int(params.get("duration_sec") or 30))
+    iso = bool(params.get("isolation"))
+    if iso:
+        with CONFIG_LOCK: CONFIG["isolation_appendvalue_only"] = True
+    bases = list(_iter_base_events(types, lookback))
+    i = 0; start = time.time()
+    try:
+        while not _av_stop.is_set() and (time.time() - start) < dur:
+            per = max(1, int(round(rps))); batch=[]
+            for _ in range(per):
+                if not bases: break
+                base = bases[i % len(bases)]; i += 1
+                new_total = rand_uniform(vmin, vmax)
+                day_off = int(rand_uniform(min(dmin,dmax), max(dmin,dmax)+0.999))
+                ev = _build_appendvalue_event(base, cfg, new_total, day_off)
+                if cfg.get("kill_event_types",{}).get("AppendValue"): continue
+                batch.append(ev)
+            if batch:
+                try: _post_capi_and_log(batch, {"event_type":"append_value","base_count":len(bases)}, cfg)
+                except Exception: pass
+            time.sleep(1.0)
+    finally:
+        if iso:
+            with CONFIG_LOCK: CONFIG["isolation_appendvalue_only"] = False
+
+@app.get("/appendvalue/preview")
+def append_preview():
+    types = (request.args.get("types","") or "").split(",") if request.args.get("types") else []
+    lookback = int(request.args.get("lookback_days") or 7)
+    sample=[]; cnt=0
+    for e in _iter_base_events(types, lookback):
+        cnt+=1
+        if len(sample)<10: sample.append({"event_name": e.get("event_name"), "event_id": e.get("event_id"), "ts": e.get("ts")})
+    return jsonify({"count": cnt, "sample": sample})
+
+@app.post("/appendvalue/start")
+def append_start():
+    global _av_thread
+    try:
+        params = request.get_json(force=True) or {}
+    except Exception:
+        return {"ok": False, "error":"invalid json"}, 400
+    _av_stop.clear()
+    t = threading.Thread(target=_appendvalue_loop, args=(params,), daemon=True); t.start(); _av_thread = t
+    return {"ok": True}
+
+@app.post("/appendvalue/stop")
+def append_stop():
+    global _av_thread
+    _av_stop.set()
+    if _av_thread is not None:
+        _av_thread.join(timeout=1.0); _av_thread = None
+    return {"ok": True}
+
 @app.get("/replay/export")
 def replay_export():
-    """Return a replayable bundle: last N capi events with timestamps."""
     with METRICS_LOCK:
         items = [e for e in list(EVENT_LOG) if e.get("channel")=="capi"][:200]
-    bundle = {
-        "version": APP_VERSION,
-        "created_at": now_iso(),
-        "events": [{"event_name": e.get("event_name"), "sent": e.get("sent"), "ts": e.get("ts")} for e in items]
-    }
+    bundle = {"version": APP_VERSION, "created_at": now_iso(), "events": [{"event_name": e.get("event_name"), "sent": e.get("sent"), "ts": e.get("ts")} for e in items]}
     return jsonify(bundle)
 
-# -------------------- Health & version --------------------
 @app.get("/healthz")
 def healthz():
-    ok = True
-    msg = []
+    ok = True; msg=[]
     if not PIXEL_ID: msg.append("PIXEL_ID missing")
     if not ACCESS_TOKEN: msg.append("ACCESS_TOKEN missing")
     return jsonify({"ok": ok, "warnings": msg})
@@ -1804,7 +1559,6 @@ def healthz():
 def version():
     return jsonify({"version": APP_VERSION})
 
-# -------------------- Entry --------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT","5000"))
     app.run(host="0.0.0.0", port=port, debug=True)
